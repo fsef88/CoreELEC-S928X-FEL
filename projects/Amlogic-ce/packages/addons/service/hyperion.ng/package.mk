@@ -1,0 +1,61 @@
+# SPDX-License-Identifier: GPL-2.0-or-later
+# Copyright (C) 2018-present Team CoreELEC (https://coreelec.org)
+
+PKG_NAME="hyperion.ng"
+PKG_VERSION="2.2.1"
+PKG_SHA256="4402c7a7e6a755ea2824c09d5d88e0fa39288b810a3cbf16c5104a0cb9160a78"
+PKG_REV="122"
+PKG_LICENSE="GPL"
+PKG_SITE="https://github.com/hyperion-project/hyperion.ng"
+PKG_URL="https://github.com/hyperion-project/hyperion.ng/archive/${PKG_VERSION}.tar.gz"
+PKG_DEPENDS_TARGET="toolchain Python3 libusb libdrm libftdi1 qt6 protobuf flatbuffers:host flatbuffers libjpeg-turbo qmdnsengine mbedtls alsa-lib"
+PKG_SECTION="service"
+PKG_SHORTDESC="Hyperion.NG: an AmbiLight controller"
+PKG_LONGDESC="Hyperion.NG(${PKG_VERSION}) is an modern opensource AmbiLight implementation."
+
+PKG_IS_ADDON="yes"
+PKG_ADDON_NAME="Hyperion.NG"
+PKG_ADDON_TYPE="xbmc.service"
+
+post_unpack() {
+  mkdir -p ${PKG_BUILD}/ce_bin_deps/bin
+  ln -s ${TOOLCHAIN}/bin/protoc ${PKG_BUILD}/ce_bin_deps/bin
+  ln -s ${TOOLCHAIN}/bin/flatc  ${PKG_BUILD}/ce_bin_deps/bin
+}
+
+pre_configure_target() {
+  CXXFLAGS+=" -Wno-reorder"
+
+  PKG_CMAKE_OPTS_TARGET="-DCMAKE_NO_SYSTEM_FROM_IMPORTED=ON \
+                         -DCMAKE_BUILD_TYPE=Release \
+                         -DUSE_PRE_BUILT_DEPS=ON \
+                         -DPRE_BUILT_DEPS_DIR=${PKG_BUILD}/ce_bin_deps \
+                         -DUSE_SYSTEM_PROTO_LIBS=ON \
+                         -DUSE_SYSTEM_FLATBUFFERS_LIBS=ON \
+                         -DUSE_SYSTEM_QMDNS_LIBS=ON \
+                         -DUSE_SYSTEM_MBEDTLS_LIBS=ON \
+                         -DUSE_SYSTEM_LIBUSB_LIBS=ON \
+                         -DPLATFORM=amlogic \
+                         -DENABLE_AMLOGIC=ON \
+                         -DENABLE_DISPMANX=OFF \
+                         -DENABLE_CEC=OFF \
+                         -DENABLE_FB=ON \
+                         -DENABLE_DEV_WS281XPWM=OFF \
+                         -DENABLE_X11=OFF \
+                         -DENABLE_V4L2=ON \
+                         -DENABLE_QT=OFF \
+                         -DENABLE_REMOTE_CTL=OFF \
+                         -DENABLE_OSX=OFF \
+                         -DENABLE_DEV_SPI=ON \
+                         -DENABLE_MDNS=ON \
+                         -DENABLE_DEV_TINKERFORGE=OFF \
+                         -DENABLE_TESTS=OFF \
+                         -DENABLE_DEPLOY_DEPENDENCIES=OFF \
+                         -DENABLE_DEV_USB_HID=OFF \
+                         -Wno-dev"
+}
+
+addon() {
+  mkdir -p ${ADDON_BUILD}/${PKG_ADDON_ID}/bin
+    cp ${PKG_BUILD}/.${TARGET_NAME}/bin/hyperiond ${ADDON_BUILD}/${PKG_ADDON_ID}/bin
+}

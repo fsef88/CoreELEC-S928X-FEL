@@ -1,0 +1,140 @@
+# Content assertions for this patch stack, checked by
+#   projects/Amlogic-ce/tools/check-patches.py apply --assertions <this file>
+#
+# WHY THIS FILE EXISTS. `patch` exiting 0 does not mean the change arrived. A
+# hunk header whose declared line counts disagree with its body makes GNU patch
+# read only the declared number of lines, silently discard the rest of that
+# hunk, lose sync for every later hunk in the same file - and still exit 0. The
+# build then succeeds with the change missing from the binary. That happened
+# here on 2026-08-08 and cost two builds before it was understood.
+#
+# So after applying the stack to pristine source we read the RESULT and assert
+# that the load-bearing lines are actually present. One or two per patch is
+# enough - pick something distinctive that would not survive a truncation.
+#
+# Format:  <path relative to the source root>:<literal string>:<exact count>
+# The string may contain colons; the count is taken from the last colon.
+# Blank lines and lines starting with # are ignored.
+
+# Prefer DISTINCTIVE DECLARATIONS over bare identifier counts. A raw name count
+# shifts whenever a comment or forward declaration is edited, which produces
+# false failures and trains you to "fix" the number instead of reading it.
+# Assert on a line the patch actually introduces.
+
+# --- 0001 / 0006 / 0007: DM target luminance overrides -----------------------
+drivers/media/enhancement/amdolby_vision/amdv.c:static unsigned int amdv_target_max_override;:1
+drivers/media/enhancement/amdolby_vision/amdv.c:module_param(amdv_target_min_override, uint, 0664);:1
+drivers/media/enhancement/amdolby_vision/amdv.c:static unsigned int amdv_target_min = 1;:1
+
+# --- 0002 / 0005: DV VSIF hold across a disc session -------------------------
+drivers/media/enhancement/amdolby_vision/amdv.c:static bool dolby_vision_vsif_hold;:1
+drivers/media/enhancement/amdolby_vision/amdv.c:void amdv_clear_vsif_hold(void):1
+# The self-heal must EMIT the swallowed DOVI->SDR transition, not just drop the
+# flags: with the core down send_hdmi_pkt() never runs again, so a truncated
+# hunk here leaves the sink latched in DV-Std until a reboot (seen 2026-08-30).
+drivers/media/enhancement/amdolby_vision/amdv.c:send pkt: DV teardown with VSIF latched, signal SDR:1
+# ...and the tail of that hunk, so truncation after the log line is caught too.
+# Count is 3: the file-static initialiser, the reset added by the self-heal,
+# and one pre-existing upstream assignment further down the file.
+drivers/media/enhancement/amdolby_vision/amdv.c:last_dst_format = FORMAT_SDR;:3
+
+# --- 0003: hold VS10 forced HDR10 across a switch ----------------------------
+drivers/media/enhancement/amdolby_vision/amdv.c:sink_hdr_support_ori_cap:2
+
+# --- 0008: cap the LLDV VSVDB peak to the content mastering peak -------------
+# The cap must be present...
+drivers/media/enhancement/amdolby_vision/amdv.c:LLDV: vsvdb peak capped:1
+# ...and the withdrawn vsvdb_changed recompute must NOT come back (see the
+# patch header: its static cache could suppress a needed re-latch after an
+# EDID re-read, which is the exact failure the patch exists to prevent).
+drivers/media/enhancement/amdolby_vision/amdv.c:last_vsvdb_tbl:0
+# ...and it is a runtime switch, OFF by default (avdvplus R10 parity: R10 never
+# runs this cap on the 5.15 CMv4.0 engine). Assert the gate AND the declaration
+# without an initialiser - a stray '= true' would silently re-enable the cap.
+drivers/media/enhancement/amdolby_vision/amdv.c:if (amdv_lldv_vsvdb_cap &&:1
+drivers/media/enhancement/amdolby_vision/amdv.c:static bool amdv_lldv_vsvdb_cap;:1
+
+# --- 0009: consumer IEC60958 channel status for multi-channel LPCM -----------
+sound/soc/amlogic/auge/tdm.c:MULTI_LPCM:2
+
+# --- 0010: establish the ALSA channel map before the first prepare -----------
+# Created at .open, removed at .close - the control's lifetime must bracket the
+# PCM's exactly. Both halves are asserted because losing either reopens a real
+# defect (a control outliving its PCM, or a pause that never restores it).
+sound/soc/amlogic/auge/tdm.c:aml_dai_tdm_chmap_ctl_create(substream, p_tdm):2
+sound/soc/amlogic/auge/tdm.c:aml_dai_tdm_chmap_ctl_remove(substream);:1
+sound/soc/amlogic/auge/tdm.c:snd_ctl_remove(card,:1
+
+# --- 0011: honest HDR10 output mastering metadata + primary order ------------
+drivers/media/enhancement/amdolby_vision/amdv.c:amdv_out_target_max_nits:2
+# The substitution must stay guarded on actually changing something, or the
+# MaxCLL/MaxFALL zeroing moves a sink's roll-off knee for no benefit.
+drivers/media/enhancement/amdolby_vision/amdv.c:tgt_max != max_lum:2
+drivers/media/enhancement/amdolby_vision/amdv.c:min_lum = (tgt_min && tgt_min <= 0xffff) ? tgt_min : 0;:1
+
+# --- 0008: the LLDV cap must stay gated on DV OUTPUT, not the LL policy alone --
+# CoreELEC 5591768488 sets ll_policy = LL_YUV422 whenever the SINK cannot do DV,
+# so the policy no longer implies DV on the wire. A bare 'dst_format ==
+# FORMAT_DOVI' count is useless here (upstream has 5 of its own), so assert the
+# comment sentence that is unique to this guard and sits inside its hunk.
+drivers/media/enhancement/amdolby_vision/amdv.c:sets ll_policy = LL_YUV422 whenever the SINK cannot do DV:1
+
+# --- negative control: proves the assertion mechanism can actually fail ------
+drivers/media/enhancement/amdolby_vision/amdv.c:zzz_this_string_must_never_exist:0
+
+# 0012: EL-miss composites BL-only (FEL menu still black screen)
+drivers/media/enhancement/amdolby_vision/amdv.c:bool el_missing = false;:1
+drivers/media/enhancement/amdolby_vision/amdv.c:el_missing = req.dv_enhance_exist && toggle_mode == 1 && !el_flag;:1
+drivers/media/enhancement/amdolby_vision/amdv.c:el_halfsize_flag = dv_inst[dv_id].el_halfsize_flag;:1
+drivers/media/enhancement/amdolby_vision/amdv.c:if (el_missing) {:1
+# Aggregate count, kept deliberately: 4 of these are pre-existing upstream
+# sites (amdv.c ~8452, ~8748, ~10078, ~11089) and only one is ours. It earns its
+# place as the hunk TAIL guard - a truncation after `el_flag = 0;` drops it to 4
+# - but upstream churn will move it, so read the sites before editing the number.
+drivers/media/enhancement/amdolby_vision/amdv.c:el_halfsize_flag = 0;:5
+
+
+# 0013: realign the EL queue at the moment of pairing (put totals + held misses)
+drivers/media/enhancement/amdolby_vision/amdv.c:static void dvel_retire_owed(const char *bl_provider, struct vframe_s *bl):1
+drivers/media/enhancement/amdolby_vision/amdv.c:dvel_retire_owed(dv_provider[vd_path], vf);:2
+drivers/media/enhancement/amdolby_vision/amdv.c:dvel_note_miss(vf, true, true);:1
+drivers/media/enhancement/amdolby_vision/amdv.c:dvel_miss_put_locked(vf);:1
+drivers/media/enhancement/amdolby_vision/amdv.c:dvel_put_baseline();:1
+drivers/media/enhancement/amdolby_vision/amdv.c:dvel_note_miss(vf, true, false);:1
+drivers/media/enhancement/amdolby_vision/amdv.c:dvel_note_noel(vf);:1
+drivers/media/enhancement/amdolby_vision/amdv.c:dvel_put_base = (s32)(bl_put - el_put) + noel;:1
+drivers/media/enhancement/amdolby_vision/amdv.c:dvel_unreg_multi = true;:1
+drivers/media/video_sink/video.c:	amdv_vf_put(vf);:1
+drivers/media/video_sink/video.c:dvel_realign_to_bl:0
+drivers/media/video_sink/video.c:Ahead of the BL's own put so the EL put total never trails the BL's::1
+# 0014: VSVDB v2 target luminance decoded as PQ codes at both parse sites; the v1
+# "* 50 + 100" formula must remain only in the two v1 branches
+drivers/media/enhancement/amdolby_vision/amdv.c:static const u32 dv_vsvdb_v2_max_nits[32] = { /* nits */:1
+drivers/media/enhancement/amdolby_vision/amdv.c:dv_vsvdb_v2_max_nits:3
+drivers/media/enhancement/amdolby_vision/amdv.c:dv_vsvdb_v2_min_lum:3
+drivers/media/enhancement/amdolby_vision/amdv.c:2485, 2876, 3330:1
+drivers/media/enhancement/amdolby_vision/amdv.c:* 50 + 100);:2
+# 0015: graphics peak can be kept off the sink at both FLAG_USE_SINK_MIN_MAX sites
+drivers/media/enhancement/amdolby_vision/amdv.c:module_param(amdv_graphics_from_sink, bool, 0664);:1
+drivers/media/enhancement/amdolby_vision/amdv.c:const u32 fmt_graphic_max = graphic_max;:2
+drivers/media/enhancement/amdolby_vision/amdv.c:if (!amdv_graphics_from_sink || amdv_graphic_max) {:2
+# 0016: OSD PQ passthrough - SDR_HDR on an OSD module becomes bypass with the
+# BT.2020 matrix, and a parameter change forces a csc re-process
+drivers/media/enhancement/amvecm/set_hdr2_v0.c:module_param(osd_pq_passthrough, uint, 0664);:1
+drivers/media/enhancement/amvecm/set_hdr2_v0.c:osd_pq_pass = true;:1
+drivers/media/enhancement/amvecm/set_hdr2_v0.c:rgb2ycbcr_ncl2020 : rgb2ycbcr_709;:1
+drivers/media/enhancement/amvecm/set_hdr2_v0.c:if ((hdr_process_select & HDR_BYPASS) && !osd_pq_pass):1
+drivers/media/enhancement/amvecm/amcsc.c:uint osd_pq_pass_sampled = READ_ONCE(osd_pq_passthrough);:1
+drivers/media/enhancement/amvecm/amcsc.c:if (osd_pq_pass_sampled != cur_osd_pq_passthrough) {:1
+drivers/media/enhancement/amvecm/amcsc.c:cur_osd_pq_passthrough = osd_pq_pass_sampled;:1
+
+# --- 0017: PQ graphics unmapped under video priority (upstream PR #41) --------
+drivers/media/enhancement/amdolby_vision/amdv.c:module_param(amdv_graphic_follow_video, uint, 0664);:1
+drivers/media/enhancement/amdolby_vision/amdv.c:new_m_dovi_setting.set_graphic_max_lum = DV_PQ_GRAPHIC_MAX_LUM;:1
+#   tail of the is_graphic_changed hunk (the live A/B re-latch)
+drivers/media/enhancement/amdolby_vision/amdv.c:old_amdv_graphic_follow_video =:1
+drivers/media/enhancement/amdolby_vision/amdv.c:new_m_dovi_setting.set_graphic_min_lum = DV_PQ_GRAPHIC_MIN_LUM;:1
+drivers/media/enhancement/amdolby_vision/amdv.c:pr_dv_dbg("graphic follow video changed %d-%d\n",:1
+
+# --- 0018: vout device checked before the sink min/max read (upstream 4dbe1c27) ---
+drivers/media/enhancement/amdolby_vision/amdv.c:		if (vinfo->vout_device && vinfo->vout_device->dv_info &&:2

@@ -1,0 +1,76 @@
+remove distracted warnings
+
+warning: 'gcc_struct' attribute directive ignored
+  this is due to 'gcc_struct' being undefined for arm
+
+remove messages when files are installed
+-- Installing: /some/destination/path
+-- Up-to-date: /some/destination/path
+
+diff --git a/cmake/modules/FindLibDvdCSS.cmake b/cmake/modules/FindLibDvdCSS.cmake
+index 4bfd077..3245f68 100644
+--- a/cmake/modules/FindLibDvdCSS.cmake
++++ b/cmake/modules/FindLibDvdCSS.cmake
+@@ -27,6 +27,8 @@ if(NOT TARGET LIBRARY::${CMAKE_FIND_PACKAGE_NAME})
+       set(${${CMAKE_FIND_PACKAGE_NAME}_MODULE}_C_FLAGS "-DPATH_MAX=2048")
+     endif()
+ 
++    string(APPEND ${${CMAKE_FIND_PACKAGE_NAME}_MODULE}_C_FLAGS "-Wno-array-parameter")
++
+     if(WIN32 OR WINDOWS_STORE)
+       if(WINDOWS_STORE)
+         list(APPEND patches "${CORE_SOURCE_DIR}/tools/depends/target/${${CMAKE_FIND_PACKAGE_NAME}_MODULE_LC}/03-win-uwpfixes.patch")
+diff --git a/cmake/modules/FindLibDvdNav.cmake b/cmake/modules/FindLibDvdNav.cmake
+index 019d4d7..7309d45 100644
+--- a/cmake/modules/FindLibDvdNav.cmake
++++ b/cmake/modules/FindLibDvdNav.cmake
+@@ -37,6 +37,9 @@ if(NOT TARGET LIBRARY::${CMAKE_FIND_PACKAGE_NAME})
+     generate_patchcommand("${patches}")
+     unset(patches)
+ 
++    list(APPEND PATCH_COMMAND COMMAND sed -i "s|(RAND_MAX+1.0)|(RAND_MAX+1.0f)|" src/vm/decoder.c src/vm/play.c)
++    list(APPEND PATCH_COMMAND COMMAND sed -i "s|.*getting information.*|#pragma GCC diagnostic ignored \"-Wreturn-type\"|g" src/vm/vmget.c)
++
+     if(${CMAKE_VERSION} VERSION_GREATER_EQUAL 3.26)
+       set(configure_env_mod ${CMAKE_COMMAND} -E env --modify NINJA=set:${NINJA_EXECUTABLE}
+                                                     ${additional_env_mod})
+diff --git a/cmake/modules/FindLibDvdRead.cmake b/cmake/modules/FindLibDvdRead.cmake
+index 0428d98..0d82709 100644
+--- a/cmake/modules/FindLibDvdRead.cmake
++++ b/cmake/modules/FindLibDvdRead.cmake
+@@ -49,6 +49,9 @@ if(NOT TARGET LIBRARY::${CMAKE_FIND_PACKAGE_NAME})
+       set(${${CMAKE_FIND_PACKAGE_NAME}_MODULE}_C_FLAGS "-DPATH_MAX=2048")
+     endif()
+ 
++    string(APPEND ${${CMAKE_FIND_PACKAGE_NAME}_MODULE}_C_FLAGS " -Wno-sign-compare -Wno-address-of-packed-member")
++    list(APPEND PATCH_COMMAND COMMAND sed -i "s|((packed,gcc_struct))|((packed))|" src/dvdread/ifo_types.h)
++
+     if(${CMAKE_VERSION} VERSION_GREATER_EQUAL 3.26)
+       set(configure_env_mod ${CMAKE_COMMAND} -E env --modify NINJA=set:${NINJA_EXECUTABLE}
+                                                     ${additional_env_mod})
+
+diff --git a/cmake/scripts/linux/Install.cmake b/cmake/scripts/linux/Install.cmake
+index a1974b2261..aa67ff0dd1 100644
+--- a/cmake/scripts/linux/Install.cmake
++++ b/cmake/scripts/linux/Install.cmake
+@@ -4,6 +4,9 @@ else()
+   set(USE_X11 0)
+ endif()
+
++# print neither "Installing" nor "Up-to-date" messages
++set(CMAKE_INSTALL_MESSAGE NEVER)
++
+ # CMake config
+ set(APP_BINARY ${APP_NAME_LC}${APP_BINARY_SUFFIX})
+ set(APP_PREFIX ${prefix})
+diff --git a/lib/libUPnP/CMakeLists.txt b/lib/libUPnP/CMakeLists.txt
+index 313893e41d..a33d9a7d4d 100644
+--- a/lib/libUPnP/CMakeLists.txt
++++ b/lib/libUPnP/CMakeLists.txt
+@@ -134,3 +134,5 @@ target_link_libraries(lib${APP_NAME_LC} PUBLIC upnp)
+ if(CORE_SYSTEM_NAME STREQUAL windowsstore)
+ 	set_target_properties(upnp PROPERTIES STATIC_LIBRARY_FLAGS "/ignore:4264")
+ endif()
++
++SET(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -Wno-nonnull-compare -Wno-unused-label -Wno-double-promotion")
+

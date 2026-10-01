@@ -1,0 +1,37 @@
+122
+- Add platform script
+121
+- Update to 2.2.1
+- Copy only hyperiond to addon
+120
+- Update to 2.2.0
+119
+- Revert back to 2.0.16
+118
+- Update to 2.1.1
+117
+- Drop platform script
+116
+- Fix compiling with toolchain
+115
+- Add support for new fb decoder
+114
+- Update to 2.0.16
+113
+- Update to 2.0.15
+112
+- fix dependencies and add new suspend/resume support suspend/resume support by PR hyperion-project/hyperion.ng#1535
+111
+- Update to 2.0.14
+110
+- Update to 2.0.13
+109
+- Update to 2.0.12
+108
+- Update to 2.0.0-alpha.11
+...
+101
+- Add Platform script
+100
+
+- Initial Release @e438bc6

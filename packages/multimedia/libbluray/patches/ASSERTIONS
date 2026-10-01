@@ -1,0 +1,117 @@
+# Content assertions for the libbluray patch stack, checked by
+#   projects/Amlogic-ce/tools/check-patches.py apply --tarball sources/libbluray/libbluray-1.5.0.tar.gz \
+#       --assertions packages/multimedia/libbluray/patches/ASSERTIONS $(ls -1 packages/multimedia/libbluray/patches/*.patch | sort)
+# `patch` exiting 0 does not prove a hunk arrived; see
+# projects/Amlogic-ce/packages/linux-drivers/amlogic/common_drivers/patches/ASSERTIONS.
+# Format:  <path relative to the source root>:<literal string>:<exact count>
+# Every needle below is absent (0) from pristine 1.5.0, so a dropped hunk fails.
+
+# 0001 headless off / JRE tmpdir
+src/libbluray/bdj/bdj.c:option[n++].optionString = str_dup   ("-Djava.io.tmpdir=/storage/.kodi/userdata/addon_data/tools.jre.zulu");:1
+# all-001 forward 1.0.2 clip info API
+src/libbluray/bluray.c:int bd_get_clip_infos(BLURAY *bd, unsigned clip, uint64_t *clip_start_time, uint64_t *stream_start_time, uint64_t *pos, uint64_t *duration):1
+# all-002 3D subtitle depth plane
+src/libbluray/bdnav/mpls_data.h:uint8_t         ss_offset_sequence_id;:1
+# all-003 HDMV BC compare
+src/libbluray/hdmv/hdmv_vm.c:case INSN_BC: p->pc += !!(src & ~dst); break;:1
+# 01 seek limited to title duration
+src/libbluray/bluray.c:if (tick > bd->title->duration):1
+# 02 seek cut-off starting packet
+src/libbluray/bdnav/clpi_parse.c:spn = (entry->coarse[ii].spn_ep & ~0x1FFFF) + entry->fine[jj].spn_ep - 1;:1
+# 03 BD-J jar search fallback
+src/libbluray/bdj/bdj.c:BD_DEBUG(DBG_BDJ, "searching for "BDJ_JARFILE" ...\n");:1
+# 04 DV EL windowed seek recovery
+src/libbluray/bluray.c:el_recover_end_pkt:8
+src/libbluray/bluray.c:_init_el_recover(st, clip_pkt);:1
+src/libbluray/bluray.c:_init_el_recover(st, st->clip->start_pkt);:1
+src/libbluray/bluray.c:_clip_dv_el_pid(st->clip));:1
+src/libbluray/decoders/m2ts_filter.c:if (el_pid > HDMV_PID_VIDEO + num_video - 1 && el_pid < HDMV_PID_AUDIO_FIRST) {:1
+src/libbluray/bluray.c:return (uint64_t)clip_pkt * 192;:1
+src/libbluray/decoders/m2ts_filter.c:num_pg + 2, sizeof(uint16_t));:2
+# 05 selectLanguage returns on success
+src/libbluray/bdj/java/org/videolan/media/content/playlist/StreamControl.java:                    return;:1
+# 06 playitem connection_condition
+src/libbluray/bluray.c:ci->connection_condition = pi->connection_condition;:1
+src/libbluray/bluray.h:connection_condition:2
+# 07 BD-J background plane + idle query
+src/libbluray/bdj/java/org/havi/ui/BackgroundPlane.java:import org.videolan.BDJXletContext;:1
+src/libbluray/bdj/java/org/videolan/BDJLoader.java:org.havi.ui.HBackgroundDevice.releaseBackgroundIfOwnerGone();:1
+src/libbluray/bdj/native/org_videolan_Libbluray.c:Java_org_videolan_Libbluray_updateBackgroundN:2
+# 08 prefer the installed jar
+src/libbluray/bdj/bdj.c:static char *_find_installed_jar(void):1
+# 10 graphics warm-up once per JVM
+src/libbluray/bdj/java/java/awt/BDGraphicsWarmup.java:public final class BDGraphicsWarmup {:1
+# 11 2160p video size
+src/libbluray/bdj/java/org/videolan/media/content/playlist/VideoControl.java:Dimension size = stream.getVideoSize();:1
+# 12 PlayItem components per stream type
+src/libbluray/bdj/java/org/bluray/ti/PlayItemImpl.java:StreamInfo[] audio = clip.getAudioStreams();:1
+# 13 BD-J timing notifications at presentation time
+src/libbluray/bluray.c:v = bd->bdj_pt_playitem;:1
+src/libbluray/bluray.c:bd->bdj_pt_playitem_valid = 1;:2
+src/libbluray/bluray.c:_write_time_psr(bd, clip, clip->in_time);:1
+src/libbluray/bluray.c:_write_time_psr(bd, bd->st0.clip, time);:1
+src/libbluray/bdj/native/org_videolan_Libbluray.c:return bdpriv_bdj_tell_time(bd);:1
+src/libbluray/bluray.c:_bdj_pt_release(bd, :8
+src/libbluray/bluray.c:bd->bdj_pt_releasing = 1;:1
+src/libbluray/bluray.c:!bd->bdj_pt_chapter_valid && param != 0xffff) {:1
+src/libbluray/bluray.c:bd->bdj_pt_chapter_seed_seq = bd->bdj_pt_seq + 1;:1
+src/libbluray/bluray.h:BD_PUBLIC void     bd_bdj_release_all(BLURAY *bd);:1
+# 14 PRESENT xlets stay NOT_LOADED until started
+src/libbluray/bdj/java/org/videolan/BDJLoader.java:proxys[i].initPresent();:1
+src/libbluray/bdj/java/org/videolan/BDJAppProxy.java:return shown;:1
+src/libbluray/bdj/java/org/videolan/BDJAppProxy.java:protected void initPresent() {:1
+src/libbluray/bdj/java/org/videolan/BDJAppProxy.java:cmd.setLoaderInit();:1
+src/libbluray/bdj/java/org/videolan/BDJAppProxy.java:if (cmd.isLoaderInit()) {:1
+src/libbluray/bdj/java/org/videolan/BDJAppProxy.java:if (masked && runMasked(cmd)):1
+src/libbluray/bdj/java/org/videolan/BDJAppProxy.java:int fromState = (maskedFrom >= 0) ? maskedFrom : state;:1
+src/libbluray/bdj/java/org/videolan/BDJAppProxy.java:private boolean runMasked(AppCommand cmd) {:1
+src/libbluray/bdj/java/org/videolan/BDJAppProxy.java:ret = (state == PAUSED);:1
+src/libbluray/bdj/java/org/videolan/BDJAppProxy.java:private volatile boolean masked = false;:1
+src/libbluray/bdj/java/org/videolan/BDJAppProxy.java:private boolean loaderInit = false;:1
+src/libbluray/bdj/java/org/videolan/BDJAppProxy.java:heldNotify.addLast(cmd);:1
+src/libbluray/bdj/java/org/videolan/BDJAppProxy.java:private void endHeldNotify(boolean replay, int at) {:1
+src/libbluray/bdj/java/org/videolan/BDJAppProxy.java:return masked ? shown : s;:1
+src/libbluray/bdj/java/org/videolan/BDJAppProxy.java:tagMaskEpoch(cmd);:2
+src/libbluray/bdj/java/org/videolan/BDJAppProxy.java:cmd.getMaskEpoch() == droppedEpoch:1
+src/libbluray/bdj/java/org/videolan/BDJAppProxy.java:replayAt = cmds.size();:1
+src/libbluray/bdj/java/org/videolan/BDJAppProxy.java:endHeldNotify(true, at);:1
+src/libbluray/bdj/java/org/videolan/BDJAppProxy.java:if (!masked && state == NOT_LOADED) {:1
+src/libbluray/bdj/java/org/videolan/BDJAppProxy.java:maskedFrom = from;:2
+src/libbluray/bdj/java/org/videolan/BDJAppProxy.java:ret = false;                /* stock: already loaded */:1
+src/libbluray/bdj/java/org/videolan/BDJAppProxy.java:mask initPresent() set while this command was already running) */:1
+# 39 pre-1.5.1 hardening backport
+src/libbluray/bdj/java/org/dvb/dsmcc/NPTRate.java:    NPTRate(int numerator, int denominator) {:1
+src/libbluray/bdj/java/org/dvb/event/EventManager.java:protected EventManager() {:1
+src/libbluray/bdnav/clpi_parse.c:BD_DEBUG(DBG_HDMV | DBG_CRIT, "clpi_parse: invalid EP fine reference %u\n", coarse[ii].ref_ep_fine_id);:1
+src/libbluray/bdnav/clpi_parse.c:if (stc_id >= atc->offset_stc_id &&:1
+src/libbluray/bdnav/clpi_parse.c:if (entry->num_ep_fine < 1) {:1
+src/libbluray/bdnav/mpls_parse.c:if (sp->sub_play_item != NULL) {:1
+src/libbluray/bdnav/navigation.c:BD_DEBUG(DBG_NAV | DBG_CRIT, "_fill_mark(): invalid play_item_ref %d\n", plm->play_item_ref);:1
+src/libbluray/bdnav/navigation.c:if (chapter >= title->chap_list.count) {:1
+src/libbluray/bdnav/navigation.c:if (mark >= title->mark_list.count) {:1
+src/libbluray/bdnav/sound_parse.c:if (bs_seek_byte(&bs, (int64_t)data_start + data_offsets[i]) < 0) {:1
+src/libbluray/decoders/graphics_processor.c:while (p && (p->buf[0] != seg_type || p->len < idv_pos + idv_len || memcmp(p->buf + idv_pos, idv, idv_len))) {:1
+src/libbluray/decoders/graphics_processor.c:BD_DEBUG(DBG_DECODE|DBG_CRIT, "Missing header in segment 0x%02x, len=%u\n", type, p->len);:1
+src/libbluray/decoders/graphics_processor.c:BD_DEBUG(DBG_DECODE|DBG_CRIT, "Missing header in segment 0x%02x, len=%u\n", type, next->len);:1
+src/libbluray/decoders/m2ts_demux.c:BD_DEBUG(DBG_DECODE, "invalid BDAV TS (PES header too short for PTS)\n");:1
+src/libbluray/decoders/pg_decode.c:#include <inttypes.h>:1
+src/libbluray/decoders/pg_decode.c:int64_t pixels_left = (int64_t)p->width * p->height;:1
+src/libbluray/decoders/pg_decode.c:BD_DEBUG(DBG_DECODE, "pg_decode_object(): too many pixels (%" PRId64 ")\n", -pixels_left);:1
+src/libbluray/decoders/pg_decode.c:BD_DEBUG(DBG_DECODE, "pg_decode_object(): missing %" PRId64 " pixels\n", pixels_left);:1
+src/libbluray/hdmv/hdmv_vm.c:case INSN_SHL:    if (src < 32) dst <<= src; else dst = 0; break;:1
+src/util/bits.c:#include "util/macro.h":1
+src/util/bits.c:static BD_USED int _bs_read( BITSTREAM *bs):1
+src/util/bits.c:static BD_USED int _bs_read_at( BITSTREAM *bs, int64_t off ):1
+src/util/bits.c:int64_t pos = bs->pos + (bs->bb.p - bs->bb.p_start);:1
+src/util/bits.c:BD_ASSERT(i_count <= 32);:2
+src/util/bits.c:if (i_count > 32) {:2
+src/util/bits.c:_bs_refill(bs);:2
+src/util/macro.h:#define BD_ASSERT(p)                                      \:1
+src/libbluray/bdj/java/org/dvb/dsmcc/DSMCCObject.java:if (!loaded):1
+src/libbluray/bdnav/clpi_parse.c:if (jj < 0) {:1
+src/libbluray/bdnav/clpi_parse.c:if (jj > 0) {:1
+# the two below also occur once in pristine 1.5.0: the count (2) is what catches a dropped hunk
+src/libbluray/bdnav/clpi_parse.c:if (cpi->num_stream_pid < 1 || !cpi->entry) {:2
+src/libbluray/bdnav/navigation.c:if (angle > 8) {:2
+# 90 drawing a null image is a no-op
+src/libbluray/bdj/java/java/awt/BDGraphicsBase.java:/* java.awt.Graphics: a null image draws nothing (the JDK returns true) */:1

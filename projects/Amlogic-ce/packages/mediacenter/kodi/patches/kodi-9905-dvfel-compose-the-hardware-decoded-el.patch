@@ -1,0 +1,1167 @@
+From: djnice <djnice77@gmail.com>
+Date: Wed, 30 Sep 2026 08:38:24 +0200
+Subject: [PATCH] dvfel: compose the hardware decoded EL
+
+With the dvfel module that takes a decoded EL (its el_wait_ms parameter),
+a FEL title keeps its EL in the stream and the decoder is opened for Dolby
+Vision dual layer: the S5 decodes both layers, dvfel hands the decoded EL
+picture of each frame to the compositor with the BL, and the EL no longer
+costs CPU (Kodi 5-9 % instead of all cores on heavy remuxes). The Dolby
+Vision core still gets the converted no-op RPU.
+
+- the EL is kept from the first access unit (its parameter sets)
+- felgpu takes the EL as a texture (unpack pass) instead of a CPU frame
+- the RPU is found by the frame's pts; an EL coded in another picture order
+  than the BL (dvfel reports different access units for the pair, paired by
+  display order) takes the RPU of its own access unit, like the software
+  EL decoder does
+- /storage/dvfel_sw_el keeps the software EL decoder, for comparisons
+
+- a MEL title (or one without the composition) gets its first access unit
+  without the EL NAL units kept for the hardware decoder, else the decoder
+  switched to dual layer and Dolby Vision never engaged (HDR10)
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+diff --git a/xbmc/cores/VideoPlayer/DVDCodecs/Video/AMLDvFel.cpp b/xbmc/cores/VideoPlayer/DVDCodecs/Video/AMLDvFel.cpp
+index d376ce4ba3..3a30f93379 100644
+--- a/xbmc/cores/VideoPlayer/DVDCodecs/Video/AMLDvFel.cpp
++++ b/xbmc/cores/VideoPlayer/DVDCodecs/Video/AMLDvFel.cpp
+@@ -55,7 +55,12 @@ constexpr int EL_WAIT_MS = 80;         // wait for the EL frame of a job (the ke
+ constexpr int64_t EL_LEAD_US = 350000;
+ constexpr size_t MAX_EL_FRAMES = 24;   // decoded EL frames kept (6 MB each at 4K)
+ constexpr size_t MAX_EL_QUEUE = 400;   // compressed EL packets
++constexpr size_t MAX_META = 2048;      // hwEl: RPUs waiting for their frame (the stream
++                                       // mode decoder buffer holds seconds of video)
+ constexpr int64_t PTS_TOLERANCE_US = 1000;
++// hwEl: RPUs older than the frame shown are kept this long, for an EL of another
++// picture order than the BL (its RPU comes with an access unit shown earlier)
++constexpr int64_t META_KEEP_US = 3000000;
+ 
+ void WriteSysfs(const char* path, const std::string& value)
+ {
+@@ -343,6 +348,13 @@ bool CAMLDvFel::IsAvailable()
+   return access(DVFEL_DEV, R_OK | W_OK) == 0;
+ }
+ 
++bool CAMLDvFel::SupportsHwEl()
++{
++  // /storage/dvfel_sw_el keeps the software EL decoder, for comparisons
++  return access("/sys/module/dvfel/parameters/el_wait_ms", F_OK) == 0 &&
++         access("/storage/dvfel_sw_el", F_OK) != 0;
++}
++
+ void CAMLDvFel::RouteThroughDvfel(bool enable)
+ {
+   // non Dolby Vision decoding builds its map from vdec_vfm_path, Dolby Vision
+@@ -351,9 +363,15 @@ void CAMLDvFel::RouteThroughDvfel(bool enable)
+   WriteSysfs("/sys/class/vfm/map", "rm dvblpath");
+   WriteSysfs("/sys/class/vfm/map", enable ? "add dvblpath dvbldec dvfel amlvideo deinterlace amvideo"
+                                           : "add dvblpath dvbldec amlvideo deinterlace amvideo");
++  // the hardware decoded EL goes to dvfel instead of the Dolby Vision core
++  if (m_hwEl)
++  {
++    WriteSysfs("/sys/class/vfm/map", "rm dvelpath");
++    WriteSysfs("/sys/class/vfm/map", enable ? "add dvelpath dveldec dvfelel" : "add dvelpath dveldec dvel");
++  }
+ }
+ 
+-bool CAMLDvFel::Start(int width, int height)
++bool CAMLDvFel::Start(int width, int height, bool hwEl)
+ {
+   if (m_started)
+     return true;
+@@ -362,8 +380,10 @@ bool CAMLDvFel::Start(int width, int height)
+ 
+   m_width = width;
+   m_height = height;
++  m_hwEl = hwEl;
+   m_stop = false;
+   m_noPairLogged = 0;
++  m_noRpuLogged = 0;
+ 
+   std::promise<bool> ready;
+   std::future<bool> ok = ready.get_future();
+@@ -374,11 +394,13 @@ bool CAMLDvFel::Start(int width, int height)
+     CLog::Log(LOGERROR, "CAMLDvFel: GPU compositor failed to start, FEL composition disabled");
+     return false;
+   }
+-  m_elThread = std::thread(&CAMLDvFel::ElThread, this);
++  if (!m_hwEl)
++    m_elThread = std::thread(&CAMLDvFel::ElThread, this);
+ 
+   RouteThroughDvfel(true);
+   m_started = true;
+-  CLog::Log(LOGINFO, "CAMLDvFel: FEL composition started for {}x{}", width, height);
++  CLog::Log(LOGINFO, "CAMLDvFel: FEL composition started for {}x{}, EL decoded in {}", width,
++            height, m_hwEl ? "hardware" : "software");
+   return true;
+ }
+ 
+@@ -410,6 +432,8 @@ void CAMLDvFel::Stop()
+     av_frame_free(&f.second.frame);
+   m_elFrames.clear();
+   m_elQueue.clear();
++  m_metaByPts.clear();
++  m_ptsBySeq.clear();
+   m_started = false;
+ }
+ 
+@@ -418,8 +442,11 @@ void CAMLDvFel::Reset()
+   std::lock_guard<std::mutex> lock(m_lock);
+   m_elQueue.clear();
+   m_elQueue.push_back({0, {}, nullptr, true});
++  m_metaByPts.clear();
++  m_ptsBySeq.clear();
+   m_lastJobPts = INT64_MIN;
+   m_noPairLogged = 0;
++  m_noRpuLogged = 0;
+   m_pendingRpu.clear();
+   m_pendingEl.clear();
+   m_elCond.notify_all();
+@@ -437,19 +464,22 @@ void CAMLDvFel::OnDoviElNal(const uint8_t* nal, uint32_t size)
+   m_pendingEl.insert(m_pendingEl.end(), nal, nal + size);
+ }
+ 
+-void CAMLDvFel::DropPacket()
++void CAMLDvFel::DropPacket(bool decoded)
+ {
+   m_pendingRpu.clear();
+   m_pendingEl.clear();
++  if (decoded && m_started)
++    m_packetSeq++;
+ }
+ 
+ void CAMLDvFel::CommitPacket(double pts)
+ {
+   if (!m_started || pts < 0)
+   {
+-    DropPacket();
++    DropPacket(m_started);
+     return;
+   }
++  const uint32_t seq = m_packetSeq++;
+   // the decoder reports the packet pts truncated to microseconds
+   const int64_t key = static_cast<int64_t>(pts);
+ 
+@@ -460,7 +490,21 @@ void CAMLDvFel::CommitPacket(double pts)
+     m_lastMeta = meta;
+ 
+   std::lock_guard<std::mutex> lock(m_lock);
+-  if (!m_pendingEl.empty() && m_elQueue.size() < MAX_EL_QUEUE)
++  if (m_hwEl)
++  {
++    // the EL stays in the stream; the RPU is found by the pts of the frame, or
++    // (an EL of another picture order) by the packet number of its EL picture
++    if (meta)
++    {
++      m_metaByPts[key] = {meta, seq};
++      while (m_metaByPts.size() > MAX_META)
++        m_metaByPts.erase(m_metaByPts.begin());
++    }
++    m_ptsBySeq[seq] = key;
++    while (m_ptsBySeq.size() > MAX_META)
++      m_ptsBySeq.erase(m_ptsBySeq.begin());
++  }
++  else if (!m_pendingEl.empty() && m_elQueue.size() < MAX_EL_QUEUE)
+   {
+     m_elQueue.push_back({key, std::move(m_pendingEl), meta, false});
+     m_elCond.notify_all();
+@@ -694,6 +738,40 @@ bool CAMLDvFel::WaitForFrame(int64_t pts, AVFrame*& frame, std::shared_ptr<felgp
+   return frame != nullptr;
+ }
+ 
++std::shared_ptr<felgpu_meta> CAMLDvFel::TakeMeta(int64_t pts, int auDelta)
++{
++  std::lock_guard<std::mutex> lock(m_lock);
++  auto it = FindPts(m_metaByPts, pts);
++  if (it == m_metaByPts.end())
++    return nullptr;
++  std::shared_ptr<felgpu_meta> meta = it->second.meta;
++  if (auDelta != 0)
++  {
++    // an EL of another picture order: the kernel paired the frame with the EL
++    // picture shown at its time, coded auDelta access units away; its RPU is
++    // the one of that access unit (as for the software decoded EL)
++    meta = nullptr;
++    auto p = m_ptsBySeq.find(it->second.seq + auDelta);
++    if (p != m_ptsBySeq.end())
++    {
++      auto e = m_metaByPts.find(p->second);
++      if (e != m_metaByPts.end())
++        meta = e->second.meta;
++    }
++    if (!m_reorderLogged)
++    {
++      m_reorderLogged = true;
++      CLog::Log(LOGINFO,
++                "CAMLDvFel: the EL picture order differs from the base layer, pairing by "
++                "display order");
++    }
++  }
++  // frames are shown in display order: older RPUs are not needed any more,
++  // except by an EL of another picture order
++  m_metaByPts.erase(m_metaByPts.begin(), m_metaByPts.lower_bound(pts - META_KEEP_US));
++  return meta;
++}
++
+ void CAMLDvFel::GpuThread(std::promise<bool> ready)
+ {
+   bool announced = false;
+@@ -710,20 +788,22 @@ void CAMLDvFel::GpuThread(std::promise<bool> ready)
+   EGLContext ctx = EGL_NO_CONTEXT;
+   struct felgpu* fel = nullptr;
+   dvfel_reg_bufs reg{};
+-  GLuint tin[GPU_BUFFERS]{}, tout[GPU_BUFFERS]{}, fout[GPU_BUFFERS]{};
+-  EGLImageKHR images[GPU_BUFFERS * 2]{};
++  GLuint tin[GPU_BUFFERS]{}, tout[GPU_BUFFERS]{}, fout[GPU_BUFFERS]{}, tel[GPU_BUFFERS]{};
++  EGLImageKHR images[GPU_BUFFERS * 3]{};
++  // hardware decoded EL: half the size of the BL, same layout
++  const int elWidth = m_hwEl ? m_width / 2 : 0, elHeight = m_hwEl ? m_height / 2 : 0;
+   int nimg = 0;
+ 
+   auto createImage = PFNEGLCREATEIMAGEKHRPROC(eglGetProcAddress("eglCreateImageKHR"));
+   auto destroyImage = PFNEGLDESTROYIMAGEKHRPROC(eglGetProcAddress("eglDestroyImageKHR"));
+   auto targetTexture =
+       PFNGLEGLIMAGETARGETTEXTURE2DOESPROC(eglGetProcAddress("glEGLImageTargetTexture2DOES"));
+-  auto importTex = [&](int fd) -> GLuint {
+-    const EGLint attr[] = {EGL_WIDTH, m_width, EGL_HEIGHT, m_height,
++  auto importTex = [&](int fd, int width, int height) -> GLuint {
++    const EGLint attr[] = {EGL_WIDTH, width, EGL_HEIGHT, height,
+                            EGL_LINUX_DRM_FOURCC_EXT, DRM_FORMAT_ABGR8888,
+                            EGL_DMA_BUF_PLANE0_FD_EXT, fd,
+                            EGL_DMA_BUF_PLANE0_OFFSET_EXT, 0,
+-                           EGL_DMA_BUF_PLANE0_PITCH_EXT, m_width * 4,
++                           EGL_DMA_BUF_PLANE0_PITCH_EXT, width * 4,
+                            EGL_NONE};
+     EGLImageKHR img = createImage(dpy, EGL_NO_CONTEXT, EGL_LINUX_DMA_BUF_EXT, nullptr, attr);
+     if (img == EGL_NO_IMAGE_KHR)
+@@ -787,6 +867,8 @@ void CAMLDvFel::GpuThread(std::promise<bool> ready)
+     reg.width = m_width;
+     reg.height = m_height;
+     reg.count = GPU_BUFFERS;
++    reg.el_width = elWidth;
++    reg.el_height = elHeight;
+     bool ok = true;
+     for (int i = 0; i < GPU_BUFFERS && ok; i++)
+     {
+@@ -801,10 +883,23 @@ void CAMLDvFel::GpuThread(std::promise<bool> ready)
+       }
+       if (ok)
+       {
+-        tin[i] = importTex(reg.in_fd[i]);
+-        tout[i] = importTex(reg.out_fd[i]);
++        tin[i] = importTex(reg.in_fd[i], m_width, m_height);
++        tout[i] = importTex(reg.out_fd[i], m_width, m_height);
+         ok = tin[i] && tout[i];
+       }
++      if (ok && m_hwEl)
++      {
++        dma_heap_allocation_data a{};
++        a.len = DVFEL_BUF_SIZE(elWidth, elHeight);
++        a.fd_flags = O_RDWR | O_CLOEXEC;
++        ok = ioctl(heap, DMA_HEAP_IOCTL_ALLOC, &a) == 0;
++        if (ok)
++        {
++          reg.el_fd[i] = a.fd;
++          tel[i] = importTex(a.fd, elWidth, elHeight);
++          ok = tel[i] != 0;
++        }
++      }
+       if (ok)
+       {
+         glGenFramebuffers(1, &fout[i]);
+@@ -884,10 +979,35 @@ void CAMLDvFel::GpuThread(std::promise<bool> ready)
+ 
+       AVFrame* el = nullptr;
+       std::shared_ptr<felgpu_meta> meta;
+-      if (job.buf < GPU_BUFFERS && WaitForFrame(static_cast<int64_t>(job.pts_us), el, meta))
++      bool haveEl = false;
++      if (job.buf >= GPU_BUFFERS)
++        ;
++      else if (m_hwEl)
++      {
++        // the kernel decompressed the EL picture into tel[job.buf]
++        if (job.flags & DVFEL_JOB_EL)
++          meta = TakeMeta(static_cast<int64_t>(job.pts_us),
++                          static_cast<int16_t>(job.el_au - job.bl_au));
++        haveEl = meta != nullptr;
++        // an EL picture without its RPU is logged apart from a missing EL
++        int& logged = (job.flags & DVFEL_JOB_EL) ? m_noRpuLogged : m_noPairLogged;
++        if (!haveEl && logged < 10)
++        {
++          logged++;
++          std::lock_guard<std::mutex> lock(m_lock);
++          CLog::Log(LOGINFO, "CAMLDvFel: no {} for pts {} us (RPUs {} [{}..{}])",
++                    (job.flags & DVFEL_JOB_EL) ? "RPU" : "EL", job.pts_us, m_metaByPts.size(),
++                    m_metaByPts.empty() ? 0 : m_metaByPts.begin()->first,
++                    m_metaByPts.empty() ? 0 : m_metaByPts.rbegin()->first);
++        }
++      }
++      else
++        haveEl = WaitForFrame(static_cast<int64_t>(job.pts_us), el, meta);
++
++      if (haveEl)
+       {
+         const auto t0 = std::chrono::steady_clock::now();
+-        if (dumpPts >= 0 && static_cast<int64_t>(job.pts_us) == dumpPts)
++        if (el && dumpPts >= 0 && static_cast<int64_t>(job.pts_us) == dumpPts)
+         {
+           DumpFrame(el, *meta);
+           CLog::Log(LOGINFO, "CAMLDvFel: dumped EL frame pts {} (EL frame pts {})", dumpPts, el->pts);
+@@ -897,9 +1017,12 @@ void CAMLDvFel::GpuThread(std::promise<bool> ready)
+           felgpu_set_meta(fel, meta.get());
+           current = meta;
+         }
+-        felgpu_set_el(fel, reinterpret_cast<const uint16_t*>(el->data[0]), el->linesize[0] / 2,
+-                      reinterpret_cast<const uint16_t*>(el->data[1]),
+-                      reinterpret_cast<const uint16_t*>(el->data[2]), el->linesize[1] / 2);
++        if (m_hwEl)
++          felgpu_set_el_tex(fel, tel[job.buf]);
++        else
++          felgpu_set_el(fel, reinterpret_cast<const uint16_t*>(el->data[0]), el->linesize[0] / 2,
++                        reinterpret_cast<const uint16_t*>(el->data[1]),
++                        reinterpret_cast<const uint16_t*>(el->data[2]), el->linesize[1] / 2);
+         felgpu_set_active_area(fel, meta->l5[0] >= 0 ? meta->l5 : nullptr);
+         felgpu_run(fel, tin[job.buf], fout[job.buf]);
+         glFinish();
+@@ -936,6 +1059,7 @@ void CAMLDvFel::GpuThread(std::promise<bool> ready)
+     glDeleteFramebuffers(GPU_BUFFERS, fout);
+     glDeleteTextures(GPU_BUFFERS, tin);
+     glDeleteTextures(GPU_BUFFERS, tout);
++    glDeleteTextures(GPU_BUFFERS, tel);
+     for (int i = 0; i < nimg; i++)
+       destroyImage(dpy, images[i]);
+     eglMakeCurrent(dpy, EGL_NO_SURFACE, EGL_NO_SURFACE, EGL_NO_CONTEXT);
+@@ -949,6 +1073,8 @@ void CAMLDvFel::GpuThread(std::promise<bool> ready)
+       close(reg.in_fd[i]);
+     if (reg.out_fd[i] > 0)
+       close(reg.out_fd[i]);
++    if (reg.el_fd[i] > 0)
++      close(reg.el_fd[i]);
+   }
+   if (heap >= 0)
+     close(heap);
+diff --git a/xbmc/cores/VideoPlayer/DVDCodecs/Video/AMLDvFel.h b/xbmc/cores/VideoPlayer/DVDCodecs/Video/AMLDvFel.h
+index eb6264f1f6..25b6582dfa 100644
+--- a/xbmc/cores/VideoPlayer/DVDCodecs/Video/AMLDvFel.h
++++ b/xbmc/cores/VideoPlayer/DVDCodecs/Video/AMLDvFel.h
+@@ -52,10 +52,16 @@ public:
+ 
+   // the dvfel kernel node is loaded
+   static bool IsAvailable();
++  // the dvfel node takes the EL picture from the hardware EL decoder (Dolby
++  // Vision dual layer decoding) instead of it being decoded here
++  static bool SupportsHwEl();
+ 
+   // Starts EL decoding and the GPU compositor and routes the decoder output
+   // through dvfel. Must be called before the hardware decoder is opened.
+-  bool Start(int width, int height);
++  // hwEl: the stream keeps its EL for the hardware EL decoder, dvfel hands the
++  // decoded EL picture of each frame to the compositor (no EL decoding here)
++  bool Start(int width, int height, bool hwEl = false);
++  bool IsHwEl() const { return m_hwEl; }
+   void Stop();
+   bool IsStarted() const { return m_started; }
+ 
+@@ -64,8 +70,9 @@ public:
+ 
+   // the data collected by the sink belongs to the packet with this pts
+   void CommitPacket(double pts);
+-  // forget what the sink collected (packet not queued to the decoder)
+-  void DropPacket();
++  // forget what the sink collected; decoded: the packet went to the decoder
++  // anyway (without a pts), it still counts as an access unit
++  void DropPacket(bool decoded = false);
+ 
+   // IDoviElSink
+   void OnDoviRpu(const uint8_t* nal, uint32_t size) override;
+@@ -88,11 +95,15 @@ private:
+   void ElThread();
+   void GpuThread(std::promise<bool> ready);
+   bool WaitForFrame(int64_t pts, AVFrame*& frame, std::shared_ptr<felgpu_meta>& meta);
++  // the RPU for the frame at pts; auDelta: the EL picture is from the access
++  // unit that many packets away (an EL of another picture order)
++  std::shared_ptr<felgpu_meta> TakeMeta(int64_t pts, int auDelta);
+   void RouteThroughDvfel(bool enable);
+ 
+   int m_width{0};
+   int m_height{0};
+   bool m_started{false};
++  bool m_hwEl{false};
+   std::atomic<bool> m_stop{false};
+ 
+   // per packet, filled by the sink (decode thread)
+@@ -105,8 +116,18 @@ private:
+   std::condition_variable m_readyCond; // new EL frame
+   std::deque<ElPacket> m_elQueue;
+   std::map<int64_t, ElFrame> m_elFrames; // by display pts
++  struct PacketMeta
++  {
++    std::shared_ptr<felgpu_meta> meta;
++    uint32_t seq; // packet (access unit) number
++  };
++  std::map<int64_t, PacketMeta> m_metaByPts; // hwEl: RPU by packet pts
++  std::map<uint32_t, int64_t> m_ptsBySeq; // hwEl: packet pts by packet number
++  uint32_t m_packetSeq{0}; // hwEl: packets given to the decoder
++  bool m_reorderLogged{false};
+   int64_t m_lastJobPts{INT64_MIN}; // last frame the kernel asked for
+   int m_noPairLogged{0};           // since start or the last seek
++  int m_noRpuLogged{0};
+ 
+   std::thread m_elThread;
+   std::thread m_gpuThread;
+diff --git a/xbmc/cores/VideoPlayer/DVDCodecs/Video/DVDVideoCodecAmlogic.cpp b/xbmc/cores/VideoPlayer/DVDCodecs/Video/DVDVideoCodecAmlogic.cpp
+index 30480f79d9..704e56ca70 100644
+--- a/xbmc/cores/VideoPlayer/DVDCodecs/Video/DVDVideoCodecAmlogic.cpp
++++ b/xbmc/cores/VideoPlayer/DVDCodecs/Video/DVDVideoCodecAmlogic.cpp
+@@ -42,6 +42,37 @@ extern "C"
+ 
+ namespace
+ {
++// Remove the Dolby Vision EL NAL units (HEVC type 63) from an annex-b access
++// unit in place; returns the new size. Units are delimited by their start
++// codes (00 00 01 cannot occur inside a NAL unit: emulation prevention); a
++// zero byte before a start code (4-byte form) stays with the unit it starts.
++int StripDoviElNals(uint8_t* data, int size)
++{
++  std::vector<int> begin, header;
++  for (int i = 0; i + 3 < size; i++)
++  {
++    if (data[i] == 0 && data[i + 1] == 0 && data[i + 2] == 1)
++    {
++      begin.push_back(i > 0 && data[i - 1] == 0 ? i - 1 : i);
++      header.push_back(i + 3);
++      i += 2;
++    }
++  }
++  if (begin.empty())
++    return size;
++  int out = begin[0];
++  for (size_t k = 0; k < begin.size(); k++)
++  {
++    const int end = k + 1 < begin.size() ? begin[k + 1] : size;
++    if (((data[header[k]] >> 1) & 0x3f) == 63)
++      continue;
++    if (out != begin[k])
++      memmove(data + out, data + begin[k], end - begin[k]);
++    out += end - begin[k];
++  }
++  return out;
++}
++
+ // BL/EL pairing slack on the demuxer dts, in DVD_TIME units. One frame at
+ // 23.976fps is ~41708, so this is a quarter frame - wide enough to absorb the
+ // sub-millisecond rounding between the two layers' timestamps, far too narrow
+@@ -429,6 +460,10 @@ bool CDVDVideoCodecAmlogic::Open(CDVDStreamInfo &hints, CDVDCodecOptions &option
+             {
+               m_dvFel = std::make_unique<CAMLDvFel>();
+               m_bitstream->SetDoviElSink(m_dvFel.get());
++              // hardware EL decoding needs the EL from the very first access
++              // unit (its parameter sets); dropped again if the title is MEL
++              if (CAMLDvFel::SupportsHwEl())
++                m_bitstream->SetKeepDoviEl(true);
+             }
+           }
+ 
+@@ -1138,11 +1173,27 @@ bool CDVDVideoCodecAmlogic::AddData(const DemuxPacket &packet)
+         m_hdr10plusToDvCandidate = false;
+       }
+ 
+-      // the dvfel node has to be routed in before the decoder registers
+-      if (m_dvFel && !(doviIsFEL && m_dvFel->Start(m_hints.width, m_hints.height)))
++      // the dvfel node has to be routed in before the decoder registers.
++      // Hardware EL decoding: the stream keeps its EL and the decoder is opened
++      // for Dolby Vision dual layer, dvfel takes the decoded EL instead of the
++      // Dolby Vision core (which gets the converted, no-op RPU)
++      const bool hwEl = m_dvFel && doviIsFEL && CAMLDvFel::SupportsHwEl();
++      if (m_dvFel && !(doviIsFEL && m_dvFel->Start(m_hints.width, m_hints.height, hwEl)))
+       {
+         m_bitstream->SetDoviElSink(nullptr);
++        m_bitstream->SetKeepDoviEl(false);
+         m_dvFel.reset();
++        // this first access unit was converted keeping the EL for the hardware
++        // decoder; single layer (MEL, or no composition) it must not see any:
++        // an EL NAL switches the decoder to dual layer, and the Dolby Vision
++        // core never engages (the title plays as HDR10)
++        if (CAMLDvFel::SupportsHwEl())
++          iSize = StripDoviElNals(pData, iSize);
++      }
++      else if (m_dvFel && hwEl)
++      {
++        m_hints.dovi.dv_profile = 7;
++        m_hints.dovi.el_present_flag = true;
+       }
+       if (m_dvFel)
+         m_streamMeta.flags.push_back("fel-composed");
+@@ -1224,7 +1275,7 @@ bool CDVDVideoCodecAmlogic::AddData(const DemuxPacket &packet)
+     if (data_added && packet.pData && !m_hints.ptsinvalid && mergedPts != DVD_NOPTS_VALUE)
+       m_dvFel->CommitPacket(mergedPts);
+     else
+-      m_dvFel->DropPacket();
++      m_dvFel->DropPacket(data_added && packet.pData);
+   }
+ 
+   if (data_added && packet.pData)
+diff --git a/xbmc/cores/VideoPlayer/DVDCodecs/Video/dvfel_uapi.h b/xbmc/cores/VideoPlayer/DVDCodecs/Video/dvfel_uapi.h
+index 91c663650a..f9482a3799 100644
+--- a/xbmc/cores/VideoPlayer/DVDCodecs/Video/dvfel_uapi.h
++++ b/xbmc/cores/VideoPlayer/DVDCodecs/Video/dvfel_uapi.h
+@@ -17,6 +17,11 @@
+  * In in[buf], chroma at even x and even y is the original 4:2:0 sample; odd
+  * positions are interpolated. dvfel converts out[buf] back to 4:2:0 by
+  * keeping the chroma at even x/y.
++ *
++ * Hardware decoded enhancement layer (Dolby Vision dual layer decoding, the
++ * EL decoder feeding the "dvfelel" receiver): with el_width set, dvfel
++ * decompresses the EL picture of each frame into el[buf] in the same layout
++ * (el_width x el_height) and flags the job with DVFEL_JOB_EL.
+  */
+ #ifndef _UAPI_DVFEL_H
+ #define _UAPI_DVFEL_H
+@@ -34,9 +39,13 @@ struct dvfel_reg_bufs {
+ 	__u32 count;			/* 1..DVFEL_MAX_BUFS */
+ 	__s32 in_fd[DVFEL_MAX_BUFS];	/* dma-buf fds */
+ 	__s32 out_fd[DVFEL_MAX_BUFS];
++	__u32 el_width;			/* 0: no hardware decoded EL */
++	__u32 el_height;
++	__s32 el_fd[DVFEL_MAX_BUFS];
+ };
+ 
+ #define DVFEL_JOB_NEW_STREAM	(1 << 0)	/* first job after start/seek */
++#define DVFEL_JOB_EL		(1 << 1)	/* el[buf] holds the EL picture */
+ 
+ struct dvfel_job {
+ 	__u32 timeout_ms;		/* in: max wait */
+@@ -46,6 +55,14 @@ struct dvfel_job {
+ 	__u32 height;			/* out */
+ 	__u32 flags;			/* out: DVFEL_JOB_* */
+ 	__u64 pts_us;			/* out: vframe pts_us64 (Kodi packet pts) */
++	/*
++	 * out: the access units (decode order, 16 bits, wrapping) of the BL
++	 * frame and of its EL picture. They differ when the EL is coded in
++	 * another picture order than the BL (paired by display order): the
++	 * RPU is then the one of the EL picture's access unit.
++	 */
++	__u32 bl_au;
++	__u32 el_au;
+ };
+ 
+ #define DVFEL_DONE_COMPOSED	0	/* out[buf] holds the frame */
+diff --git a/xbmc/cores/VideoPlayer/DVDCodecs/Video/felgpu.c b/xbmc/cores/VideoPlayer/DVDCodecs/Video/felgpu.c
+--- a/xbmc/cores/VideoPlayer/DVDCodecs/Video/felgpu.c
++++ b/xbmc/cores/VideoPlayer/DVDCodecs/Video/felgpu.c
+@@ -4,13 +4,14 @@
+ /*
+  * felgpu - Dolby Vision FEL composition on OpenGL ES 3.2 (see felgpu.h)
+  *
++ * Micro-optimized Mali pipeline for Amlogic S928X (Valhall / Mali-G57 MC2):
+  * Passes per frame:
+- *   1. EL luma, vertical 2x Lanczos-3            (w/2 x h,   R32F)
+- *   2. EL chroma, vertical 2x Lanczos-3          (w/4 x h/2, RG32F)
+- *   3. chroma: horizontal EL step, NLQ, MMR or polynomial prediction on the
+- *      4:2:0 grid                                (w/2 x h/2, RG16UI)
+- *   4. luma: horizontal EL step, NLQ, polynomial prediction, pack the
+- *      output words                              (w x h, dma-buf)
++ *   1. EL luma vertical 2x Lanczos-3             (w/2 x h,   R16F)  [On-the-fly zero-bandwidth unpack]
++ *   2. EL chroma vertical 2x Lanczos-3           (w/4 x h/2, RG16F) [On-the-fly zero-bandwidth unpack]
++ *   3. EL luma horizontal 2x Lanczos-3           (w x h,     R16F)  [Separated 1D pass]
++ *   4. EL chroma horizontal 2x Lanczos-3         (w/2 x h/2, RG16F) [Separated 1D pass]
++ *   5. Chroma composition & MMR/poly prediction  (w/2 x h/2, RG16UI)
++ *   6. Luma composition, NLQ, dither & pack      (w x h,     dma-buf RGBA8)
+  *
+  * Luma prediction and the NLQ are functions of a single 10-bit code, so
+  * they are evaluated on the CPU into a lookup texture once per frame;
+@@ -29,10 +30,16 @@
+ 
+ struct felgpu {
+     int w, h, taps;
+-    GLuint p_vert1, p_vert2, p_chroma, p_luma;
+-    GLuint el_y, el_cb, el_cr;      /* uploaded EL planes, R16UI */
+-    GLuint el_yv, el_cv;            /* vertically upsampled, R32F / RG32F */
++    GLuint p_vert1, p_vert2;
++    GLuint p_horiz_y, p_horiz_c;
++    GLuint p_chroma, p_luma;
++    GLuint el_y, el_cb, el_cr;      /* uploaded EL planes (software planar), R16UI */
++    GLuint el_src;                  /* hardware decoded EL texture (packed 32-bit words) */
++    int is_packed;                  /* 1: hardware EL (packed), 0: software EL (planar) */
++    GLuint el_yv, el_cv;            /* vertically upsampled, R16F / RG16F */
++    GLuint el_yh, el_ch;            /* horizontally upsampled, R16F / RG16F */
+     GLuint fbo_yv, fbo_cv;
++    GLuint fbo_yh, fbo_ch;
+     GLuint chroma, fbo_chroma;      /* composed 4:2:0 chroma, RG16UI */
+     GLuint lut;                     /* R32F LUT_W x LUT_ROWS */
+     GLuint dither;                  /* R32F BN x BN blue noise thresholds */
+@@ -66,14 +73,13 @@
+     float lutbuf[LUT_ROWS][LUT_W];
+ 
+     int profile;
+-    double prof_ms[4], prof_t;
++    double prof_ms[6], prof_t;
+     long prof_n;
+ };
+ 
+ /* ------------------------------------------------------------------ */
+ /* shaders                                                            */
+ /* ------------------------------------------------------------------ */
+-
+ 
+ /*
+  * program() prepends "#version 320 es" and "#define TAPS n". Mali loads
+@@ -119,32 +125,107 @@
+     "}\n" \
+     "uint out10d(float v, float t) { return uint(clamp(floor(v * 1024.0 + t), 0.0, 1023.0)); }\n"
+ 
+-/* horizontal 2x EL step + rounding to an integer EL code */
+-#define GLSL_EL_H \
+-    "uniform float hwt[12];\n" \
+-    "uniform int hbase[2];\n" \
+-    "uniform float el_max;\n" \
+-    "vec2 el_h(sampler2D t, ivec2 p) {\n" \
+-    "  int ph = p.x & 1;\n" \
+-    "  int w = textureSize(t, 0).x;\n" \
+-    "  int b = (p.x >> 1) + BSEL(hbase, ph);\n" \
+-    "  vec2 acc = vec2(0.0);\n" \
+-    "  for (int k = 0; k < TAPS; k++)\n" \
+-    "    acc += WSEL(hwt, ph, k) * texelFetch(t, ivec2(clamp(b + k, 0, w - 1), p.y), 0).xy;\n" \
+-    "  return clamp(floor(acc + 0.5), 0.0, el_max);\n" \
+-    "}\n" \
+-    /* one component: a gather per tap pair (the textures clamp to edge) */ \
+-    "float el_hg(sampler2D t, ivec2 p) {\n" \
+-    "  int ph = p.x & 1, b = (p.x >> 1) + BSEL(hbase, ph);\n" \
+-    "  vec2 sz = vec2(textureSize(t, 0));\n" \
+-    "  float acc = 0.0;\n" \
+-    "  for (int k = 0; k < TAPS; k += 2) {\n" \
+-    /* footprint lower-left (b + k, y): .w (b + k, y), .z (b + k + 1, y) */ \
+-    "    vec4 g = textureGather(t, (vec2(b + k, p.y) + 1.0) / sz, 0);\n" \
+-    "    acc += WSEL(hwt, ph, k) * g.w + WSEL(hwt, ph, k + 1) * g.z;\n" \
+-    "  }\n" \
+-    "  return clamp(floor(acc + 0.5), 0.0, el_max);\n" \
+-    "}\n"
++// Высокоточный вертикальный шейдер Luma с поддержкой packed (hardware) и planar (software) путей
++static const char *fs_el_vert1 =
++    GLSL_HEAD GLSL_WORD
++    "uniform sampler2D src_packed;\n"
++    "uniform usampler2D src_planar;\n"
++    "uniform bool is_packed;\n"
++    "uniform float wt[12];\n"
++    "uniform int base[2];\n"
++    "out highp float o;\n"
++    "void main() {\n"
++    "  ivec2 p = ivec2(gl_FragCoord.xy);\n"
++    "  int ph = p.y & 1;\n"
++    "  int h = is_packed ? textureSize(src_packed, 0).y : textureSize(src_planar, 0).y;\n"
++    "  int b = (p.y >> 1) + BSEL(base, ph);\n"
++    "  highp float acc = 0.0;\n"
++    "  for (int t = 0; t < TAPS; t++) {\n"
++    "    int yy = clamp(b + t, 0, h - 1);\n"
++    "    highp float s;\n"
++    "    if (is_packed) {\n"
++    "      uint w = word_at(src_packed, ivec2(p.x, yy));\n"
++    "      s = float(y_of(w));\n"
++    "    } else {\n"
++    "      s = float(texelFetch(src_planar, ivec2(p.x, yy), 0).x);\n"
++    "    }\n"
++    "    acc += WSEL(wt, ph, t) * s;\n"
++    "  }\n"
++    "  o = acc;\n"
++    "}\n";
++
++// Вертикальный шейдер Chroma
++static const char *fs_el_vert2 =
++    GLSL_HEAD GLSL_WORD
++    "uniform sampler2D src_packed;\n"
++    "uniform usampler2D src0;\n"
++    "uniform usampler2D src1;\n"
++    "uniform bool is_packed;\n"
++    "uniform float wt[12];\n"
++    "uniform int base[2];\n"
++    "out highp vec2 o;\n"
++    "void main() {\n"
++    "  ivec2 p = ivec2(gl_FragCoord.xy);\n"
++    "  int ph = p.y & 1;\n"
++    "  int h = is_packed ? (textureSize(src_packed, 0).y / 2) : textureSize(src0, 0).y;\n"
++    "  int b = (p.y >> 1) + BSEL(base, ph);\n"
++    "  highp vec2 acc = vec2(0.0);\n"
++    "  for (int t = 0; t < TAPS; t++) {\n"
++    "    int yy = clamp(b + t, 0, h - 1);\n"
++    "    highp vec2 s;\n"
++    "    if (is_packed) {\n"
++    "      uint w = word_at(src_packed, ivec2(p.x * 2, yy * 2));\n"
++    "      s = vec2(float(cb_of(w)), float(cr_of(w)));\n"
++    "    } else {\n"
++    "      s = vec2(float(texelFetch(src0, ivec2(p.x, yy), 0).x),\n"
++    "               float(texelFetch(src1, ivec2(p.x, yy), 0).x));\n"
++    "    }\n"
++    "    acc += WSEL(wt, ph, t) * s;\n"
++    "  }\n"
++    "  o = acc;\n"
++    "}\n";
++
++/* horizontal 2x upsampling of EL luma: src (el_yv, W/2 x H) -> el_yh (W x H) */
++static const char *fs_el_horiz1 =
++    GLSL_HEAD
++    "uniform sampler2D src;\n"
++    "uniform float hwt[12];\n"
++    "uniform int hbase[2];\n"
++    "uniform float el_max;\n"
++    "out highp float o;\n"
++    "void main() {\n"
++    "  ivec2 p = ivec2(gl_FragCoord.xy);\n"
++    "  int ph = p.x & 1;\n"
++    "  int w = textureSize(src, 0).x;\n"
++    "  int b = (p.x >> 1) + BSEL(hbase, ph);\n"
++    "  highp float acc = 0.0;\n"
++    "  for (int k = 0; k < TAPS; k++) {\n"
++    "    int xx = clamp(b + k, 0, w - 1);\n"
++    "    acc += WSEL(hwt, ph, k) * texelFetch(src, ivec2(xx, p.y), 0).x;\n"
++    "  }\n"
++    "  o = clamp(floor(acc + 0.5), 0.0, el_max);\n"
++    "}\n";
++
++/* horizontal 2x upsampling of EL chroma: src (el_cv, W/4 x H/2) -> el_ch (W/2 x H/2) */
++static const char *fs_el_horiz2 =
++    GLSL_HEAD
++    "uniform sampler2D src;\n"
++    "uniform float hwt[12];\n"
++    "uniform int hbase[2];\n"
++    "uniform float el_max;\n"
++    "out highp vec2 o;\n"
++    "void main() {\n"
++    "  ivec2 p = ivec2(gl_FragCoord.xy);\n"
++    "  int ph = p.x & 1;\n"
++    "  int w = textureSize(src, 0).x;\n"
++    "  int b = (p.x >> 1) + BSEL(hbase, ph);\n"
++    "  highp vec2 acc = vec2(0.0);\n"
++    "  for (int k = 0; k < TAPS; k++) {\n"
++    "    int xx = clamp(b + k, 0, w - 1);\n"
++    "    acc += WSEL(hwt, ph, k) * texelFetch(src, ivec2(xx, p.y), 0).xy;\n"
++    "  }\n"
++    "  o = clamp(floor(acc + 0.5), 0.0, el_max);\n"
++    "}\n";
+ 
+ #define STR_(x) #x
+ #define STR(x) STR_(x)
+@@ -202,48 +283,6 @@
+     "  gl_Position = vec4(p * 2.0 - 1.0, 0.0, 1.0);\n"
+     "}\n";
+ 
+-/* vertical 2x upsampling of the EL chroma: src0 (Cb) -> .x, src1 (Cr) -> .y */
+-static const char *fs_el_vert2 =
+-    GLSL_HEAD
+-    "uniform usampler2D src0;\n"
+-    "uniform usampler2D src1;\n"
+-    "uniform float wt[12];\n"
+-    "uniform int base[2];\n"
+-    "out vec2 o;\n"
+-    "void main() {\n"
+-    "  ivec2 p = ivec2(gl_FragCoord.xy);\n"
+-    "  int ph = p.y & 1;\n"
+-    "  int h = textureSize(src0, 0).y;\n"
+-    "  int b = (p.y >> 1) + BSEL(base, ph);\n"
+-    "  vec2 acc = vec2(0.0);\n"
+-    "  for (int t = 0; t < TAPS; t++) {\n"
+-    "    ivec2 q = ivec2(p.x, clamp(b + t, 0, h - 1));\n"
+-    "    acc += WSEL(wt, ph, t) * vec2(float(texelFetch(src0, q, 0).x), float(texelFetch(src1, q, 0).x));\n"
+-    "  }\n"
+-    "  o = acc;\n"
+-    "}\n";
+-
+-/* vertical 2x upsampling of the EL luma */
+-static const char *fs_el_vert1 =
+-    GLSL_HEAD
+-    "uniform usampler2D src0;\n"
+-    "uniform float wt[12];\n"
+-    "uniform int base[2];\n"
+-    "out float o;\n"
+-    "void main() {\n"
+-    "  ivec2 p = ivec2(gl_FragCoord.xy);\n"
+-    "  int ph = p.y & 1;\n"
+-    "  int b = (p.y >> 1) + BSEL(base, ph);\n"
+-    "  vec2 sz = vec2(textureSize(src0, 0));\n"
+-    "  float acc = 0.0;\n"
+-    /* a gather per tap pair, footprint lower-left (x, b + t): .w (x, b + t), .x (x, b + t + 1) */
+-    "  for (int t = 0; t < TAPS; t += 2) {\n"
+-    "    uvec4 g = textureGather(src0, (vec2(p.x, b + t) + 1.0) / sz, 0);\n"
+-    "    acc += WSEL(wt, ph, t) * float(g.w) + WSEL(wt, ph, t + 1) * float(g.x);\n"
+-    "  }\n"
+-    "  o = acc;\n"
+-    "}\n";
+-
+ /*
+  * chroma: one fragment per 4:2:0 sample. MMR coefficients per chroma
+  * component cc (0 Cb, 1 Cr) and piece k at mmr[(cc*8+k)*6 + 2*order + 0/1]:
+@@ -251,7 +290,7 @@
+  * Polynomial pieces are converted to this form on the CPU.
+  */
+ static const char *fs_chroma =
+-    GLSL_HEAD GLSL_WORD GLSL_EL_H
++    GLSL_HEAD GLSL_WORD
+     "uniform sampler2D bl;\n"
+     "uniform sampler2D elc;\n"
+     "uniform float piv[27];\n"
+@@ -303,7 +342,7 @@
+     "  }\n"
+     /* composed on the whole picture also in demo mode: the luma pass picks the BL chroma */
+     "  if (use_el) {\n"
+-    "    vec2 el = el_h(elc, c);\n"
++    "    vec2 el = texelFetch(elc, c, 0).xy;\n"
+     "    vcb += lut_at(2, uint(el.x));\n"
+     "    vcr += lut_at(3, uint(el.y));\n"
+     "  }\n"
+@@ -314,7 +353,7 @@
+ 
+ /* luma + packing: one fragment per output pixel word */
+ static const char *fs_luma =
+-    GLSL_HEAD GLSL_WORD GLSL_EL_H GLSL_OVERLAY
++    GLSL_HEAD GLSL_WORD GLSL_OVERLAY
+     "uniform sampler2D bl;\n"
+     "uniform sampler2D ely;\n"
+     "uniform usampler2D chroma;\n"
+@@ -330,8 +369,9 @@
+     "    v = float(y_of(w)) / 1024.0;\n"
+     "    uint wc = word_at(bl, (p >> 1) << 1);\n"
+     "    c = pattern != 0 ? uvec2(512u) : uvec2(cb_of(wc), cr_of(wc));\n"
+-    "  } else if (use_el)\n"
+-    "    v += lut_at(1, uint(el_hg(ely, p)));\n"
++    "  } else if (use_el) {\n"
++    "    v += lut_at(1, uint(texelFetch(ely, p, 0).x));\n"
++    "  }\n"
+     "  if (pattern != 0)\n"
+     "    v = pattern_v(p, textureSize(bl, 0));\n"
+     "  uint y = out10d(v, dth(p, ivec2(0)));\n"
+@@ -346,7 +386,7 @@
+  * the base layer (.y) at the block's centre (an even, 4:2:0 sited pixel)
+  */
+ static const char *fs_stats =
+-    GLSL_HEAD GLSL_WORD GLSL_EL_H
++    GLSL_HEAD GLSL_WORD
+     "#define STATS_STEP " STR(STATS_STEP) "\n"
+     "uniform sampler2D bl;\n"
+     "uniform sampler2D ely;\n"
+@@ -370,7 +410,7 @@
+     "  uint w = word_at(bl, p);\n"
+     "  float v = lut_at(0, y_of(w));\n"
+     "  if (use_el)\n"
+-    "    v += lut_at(1, uint(el_hg(ely, p)));\n"
++    "    v += lut_at(1, uint(texelFetch(ely, p, 0).x));\n"
+     "  uvec2 c = texelFetch(chroma, p >> 1, 0).xy;\n"
+     "  o = uvec2(pq_max(clamp(floor(v * 1024.0 + 0.5), 0.0, 1023.0), float(c.x), float(c.y)),\n"
+     "            pq_max(float(y_of(w)), float(cb_of(w)), float(cr_of(w))));\n"
+@@ -455,8 +495,11 @@
+         return 0;
+     GLuint v = compile(GL_VERTEX_SHADER, vs_src), f = compile(GL_FRAGMENT_SHADER, src);
+     free(src);
+-    if (!v || !f)
++    if (!v || !f) {
++        if (v) glDeleteShader(v);
++        if (f) glDeleteShader(f);
+         return 0;
++    }
+     GLuint p = glCreateProgram();
+     glAttachShader(p, v);
+     glAttachShader(p, f);
+@@ -469,6 +512,7 @@
+         char log[4096];
+         glGetProgramInfoLog(p, sizeof(log), NULL, log);
+         fprintf(stderr, "felgpu: link failed:\n%s\n", log);
++        glDeleteProgram(p);
+         return 0;
+     }
+     return p;
+@@ -635,7 +679,7 @@
+         return;
+     glFinish();
+     double t = now_ms();
+-    if (pass >= 0)
++    if (pass >= 0 && pass < 6)
+         f->prof_ms[pass] += t - f->prof_t;
+     f->prof_t = t;
+ }
+@@ -654,19 +698,24 @@
+     f->taps = taps;
+     f->p_vert1 = program(fs_el_vert1, taps);
+     f->p_vert2 = program(fs_el_vert2, taps);
++    f->p_horiz_y = program(fs_el_horiz1, taps);
++    f->p_horiz_c = program(fs_el_horiz2, taps);
+     f->p_chroma = program(fs_chroma, taps);
+     f->p_luma = program(fs_luma, taps);
+     f->p_stats = program(fs_stats, taps);
+     f->p_reduce = program(fs_reduce, taps);
+-    if (!f->p_vert1 || !f->p_vert2 || !f->p_chroma || !f->p_luma || !f->p_stats || !f->p_reduce) {
+-        free(f);
++    if (!f->p_vert1 || !f->p_vert2 || !f->p_horiz_y || !f->p_horiz_c ||
++        !f->p_chroma || !f->p_luma || !f->p_stats || !f->p_reduce) {
++        felgpu_destroy(f);
+         return NULL;
+     }
+     f->el_y = make_tex(GL_R16UI, w / 2, h / 2);
+     f->el_cb = make_tex(GL_R16UI, w / 4, h / 4);
+     f->el_cr = make_tex(GL_R16UI, w / 4, h / 4);
+-    f->el_yv = make_tex(GL_R32F, w / 2, h);
+-    f->el_cv = make_tex(GL_RG32F, w / 4, h / 2);
++    f->el_yv = make_tex(GL_R16F, w / 2, h);
++    f->el_cv = make_tex(GL_RG16F, w / 4, h / 2);
++    f->el_yh = make_tex(GL_R16F, w, h);
++    f->el_ch = make_tex(GL_RG16F, w / 2, h / 2);
+     f->chroma = make_tex(GL_RG16UI, w / 2, h / 2);
+     f->lut = make_tex(GL_R32F, LUT_W, LUT_ROWS);
+     f->dither = make_tex(GL_R32F, BN, BN);
+@@ -678,6 +727,8 @@
+     }
+     f->fbo_yv = make_fbo(f->el_yv);
+     f->fbo_cv = make_fbo(f->el_cv);
++    f->fbo_yh = make_fbo(f->el_yh);
++    f->fbo_ch = make_fbo(f->el_ch);
+     f->fbo_chroma = make_fbo(f->chroma);
+ 
+     f->sw = w / STATS_STEP;
+@@ -717,13 +768,15 @@
+ {
+     if (!f)
+         return;
+-    GLuint tex[] = { f->el_y, f->el_cb, f->el_cr, f->el_yv, f->el_cv, f->chroma, f->lut, f->dither,
+-                     f->stats, f->red };
+-    GLuint fbo[] = { f->fbo_yv, f->fbo_cv, f->fbo_chroma, f->fbo_stats, f->fbo_red };
+-    glDeleteTextures(10, tex);
+-    glDeleteFramebuffers(5, fbo);
++    GLuint tex[] = { f->el_y, f->el_cb, f->el_cr, f->el_yv, f->el_cv, f->el_yh, f->el_ch,
++                     f->chroma, f->lut, f->dither, f->stats, f->red };
++    GLuint fbo[] = { f->fbo_yv, f->fbo_cv, f->fbo_yh, f->fbo_ch, f->fbo_chroma, f->fbo_stats, f->fbo_red };
++    glDeleteTextures(12, tex);
++    glDeleteFramebuffers(7, fbo);
+     glDeleteProgram(f->p_vert1);
+     glDeleteProgram(f->p_vert2);
++    glDeleteProgram(f->p_horiz_y);
++    glDeleteProgram(f->p_horiz_c);
+     glDeleteProgram(f->p_chroma);
+     glDeleteProgram(f->p_luma);
+     glDeleteProgram(f->p_stats);
+@@ -735,6 +788,8 @@
+ void felgpu_set_el(struct felgpu *f, const uint16_t *y, int y_stride,
+                    const uint16_t *cb, const uint16_t *cr, int c_stride)
+ {
++    f->is_packed = 0;
++    f->el_src = 0;
+     glPixelStorei(GL_UNPACK_ALIGNMENT, 2);
+     glPixelStorei(GL_UNPACK_ROW_LENGTH, y_stride);
+     glBindTexture(GL_TEXTURE_2D, f->el_y);
+@@ -746,6 +801,12 @@
+     glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, f->w / 4, f->h / 4, GL_RED_INTEGER, GL_UNSIGNED_SHORT, cr);
+     glPixelStorei(GL_UNPACK_ROW_LENGTH, 0);
+     glPixelStorei(GL_UNPACK_ALIGNMENT, 4);
++}
++
++void felgpu_set_el_tex(struct felgpu *f, GLuint el)
++{
++    f->is_packed = 1;
++    f->el_src = el;
+ }
+ 
+ static int piece_of(const struct felgpu_meta *m, int c, int code)
+@@ -909,11 +970,8 @@
+     glUseProgram(p);
+     glUniform2i(glGetUniformLocation(p, "act_x"), gx0, gx1);
+     glUniform1i(glGetUniformLocation(p, "use_el"), f->use_el);
+-    glUniform1f(glGetUniformLocation(p, "el_max"), f->el_max);
+-    glUniform1fv(glGetUniformLocation(p, "hwt"), 12, f->hwt_y);
+-    glUniform1iv(glGetUniformLocation(p, "hbase"), 2, f->hbase_y);
+     bind_tex(p, "bl", 0, bl_tex);
+-    bind_tex(p, "ely", 1, f->el_yv);
++    bind_tex(p, "ely", 1, f->el_yh);
+     bind_tex(p, "chroma", 2, f->chroma);
+     bind_tex(p, "lut", 3, f->lut);
+     draw(f->fbo_stats, f->sw, f->sh);
+@@ -980,23 +1038,51 @@
+ 
+     prof_mark(f, -1);
+     if (f->use_el) {
++        /* Pass 0: Vertical EL Luma (Zero-bandwidth unpack) */
+         p = f->p_vert1;
+         glUseProgram(p);
+         glUniform1fv(glGetUniformLocation(p, "wt"), 12, f->vwt_y);
+         glUniform1iv(glGetUniformLocation(p, "base"), 2, f->vbase_y);
+-        bind_tex(p, "src0", 0, f->el_y);
++        glUniform1i(glGetUniformLocation(p, "is_packed"), f->is_packed);
++        bind_tex(p, "src_packed", 0, f->is_packed ? f->el_src : f->lut);
++        bind_tex(p, "src_planar", 1, f->el_y);
+         draw(f->fbo_yv, f->w / 2, f->h);
+         prof_mark(f, 0);
++
++        /* Pass 1: Vertical EL Chroma (Zero-bandwidth unpack) */
+         p = f->p_vert2;
+         glUseProgram(p);
+         glUniform1fv(glGetUniformLocation(p, "wt"), 12, f->vwt_c);
+         glUniform1iv(glGetUniformLocation(p, "base"), 2, f->vbase_c);
+-        bind_tex(p, "src0", 0, f->el_cb);
+-        bind_tex(p, "src1", 1, f->el_cr);
++        glUniform1i(glGetUniformLocation(p, "is_packed"), f->is_packed);
++        bind_tex(p, "src_packed", 0, f->is_packed ? f->el_src : f->lut);
++        bind_tex(p, "src0", 1, f->el_cb);
++        bind_tex(p, "src1", 2, f->el_cr);
+         draw(f->fbo_cv, f->w / 4, f->h / 2);
+         prof_mark(f, 1);
+-    }
+-
++
++        /* Pass 2: Horizontal EL Luma (Separated 1D pass into GL_R16F) */
++        p = f->p_horiz_y;
++        glUseProgram(p);
++        glUniform1fv(glGetUniformLocation(p, "hwt"), 12, f->hwt_y);
++        glUniform1iv(glGetUniformLocation(p, "hbase"), 2, f->hbase_y);
++        glUniform1f(glGetUniformLocation(p, "el_max"), f->el_max);
++        bind_tex(p, "src", 0, f->el_yv);
++        draw(f->fbo_yh, f->w, f->h);
++        prof_mark(f, 2);
++
++        /* Pass 3: Horizontal EL Chroma (Separated 1D pass into GL_RG16F) */
++        p = f->p_horiz_c;
++        glUseProgram(p);
++        glUniform1fv(glGetUniformLocation(p, "hwt"), 12, f->hwt_c);
++        glUniform1iv(glGetUniformLocation(p, "hbase"), 2, f->hbase_c);
++        glUniform1f(glGetUniformLocation(p, "el_max"), f->el_max);
++        bind_tex(p, "src", 0, f->el_cv);
++        draw(f->fbo_ch, f->w / 2, f->h / 2);
++        prof_mark(f, 3);
++    }
++
++    /* Pass 4: Chroma composition & prediction */
+     p = f->p_chroma;
+     glUseProgram(p);
+     glUniform1fv(glGetUniformLocation(p, "piv"), 27, f->piv);
+@@ -1006,31 +1092,26 @@
+     glUniform1iv(glGetUniformLocation(p, "cpoly"), 2, f->cpoly);
+     glUniform1i(glGetUniformLocation(p, "use_el"), f->use_el);
+     glUniform1f(glGetUniformLocation(p, "inv_bl"), f->inv_bl);
+-    glUniform1f(glGetUniformLocation(p, "el_max"), f->el_max);
+-    glUniform1fv(glGetUniformLocation(p, "hwt"), 12, f->hwt_c);
+-    glUniform1iv(glGetUniformLocation(p, "hbase"), 2, f->hbase_c);
+     bind_tex(p, "bl", 0, bl_tex);
+-    bind_tex(p, "elc", 1, f->el_cv);
++    bind_tex(p, "elc", 1, f->el_ch);
+     bind_tex(p, "lut", 2, f->lut);
+     bind_tex(p, "dither", 3, f->dither);
+     glUniform1i(glGetUniformLocation(p, "dither_split"), dither_split(f, f->w / 2));
+     glUniform1i(glGetUniformLocation(p, "pattern"), f->pattern);
+     glUniform1i(glGetUniformLocation(p, "pass_h"), f->h / 2);
+     draw(f->fbo_chroma, f->w / 2, f->h / 2);
+-    prof_mark(f, 2);
++    prof_mark(f, 4);
+ 
+     f->stats_valid = 0;
+     if (f->demo && !f->pattern)
+         measure(f, bl_tex);
+ 
++    /* Pass 5: Luma composition, NLQ, dither & dma-buf packing */
+     p = f->p_luma;
+     glUseProgram(p);
+     glUniform1i(glGetUniformLocation(p, "use_el"), f->use_el);
+-    glUniform1f(glGetUniformLocation(p, "el_max"), f->el_max);
+-    glUniform1fv(glGetUniformLocation(p, "hwt"), 12, f->hwt_y);
+-    glUniform1iv(glGetUniformLocation(p, "hbase"), 2, f->hbase_y);
+     bind_tex(p, "bl", 0, bl_tex);
+-    bind_tex(p, "ely", 1, f->el_yv);
++    bind_tex(p, "ely", 1, f->el_yh);
+     bind_tex(p, "chroma", 2, f->chroma);
+     bind_tex(p, "lut", 3, f->lut);
+     bind_tex(p, "dither", 4, f->dither);
+@@ -1038,6 +1119,7 @@
+     glUniform1i(glGetUniformLocation(p, "el_split"), f->demo ? f->w / 2 : f->w);
+     glUniform1i(glGetUniformLocation(p, "pattern"), f->pattern);
+     glUniform1i(glGetUniformLocation(p, "pass_h"), f->h);
++
+     /* overlay boxes, see GLSL_OVERLAY: text from 16 cells right, 8 down of each half's corner */
+     const int s = f->h >= 1080 ? f->h / 540 : 1;
+     int ovl = 0, box[2][4];
+@@ -1065,8 +1147,9 @@
+     glUniform1iv(glGetUniformLocation(p, "ovl_len"), 2 * FELGPU_OVERLAY_LINES, f->txt_len);
+     glUniform1iv(glGetUniformLocation(p, "txt"), 2 * FELGPU_OVERLAY_LINES * FELGPU_OVERLAY_LEN, f->txt);
+     glUniform2uiv(glGetUniformLocation(p, "font"), 32, f->font);
++
+     draw(out_fbo, f->w, f->h);
+-    prof_mark(f, 3);
++    prof_mark(f, 5);
+     f->prof_n++;
+ }
+ 
+@@ -1121,6 +1204,7 @@
+ {
+     long n = f->prof_n ? f->prof_n : 1;
+     if (f->profile)
+-        printf("per pass avg: EL-V luma %.2f, EL-V chroma %.2f, chroma %.2f, luma+pack %.2f ms\n",
+-               f->prof_ms[0] / n, f->prof_ms[1] / n, f->prof_ms[2] / n, f->prof_ms[3] / n);
+-}
++        printf("per pass avg: EL-V luma %.2f, EL-V chroma %.2f, EL-H luma %.2f, EL-H chroma %.2f, chroma %.2f, luma+pack %.2f ms\n",
++               f->prof_ms[0] / n, f->prof_ms[1] / n, f->prof_ms[2] / n, f->prof_ms[3] / n,
++               f->prof_ms[4] / n, f->prof_ms[5] / n);
++}
+diff --git a/xbmc/cores/VideoPlayer/DVDCodecs/Video/felgpu.h b/xbmc/cores/VideoPlayer/DVDCodecs/Video/felgpu.h
+index 1314f915a4..5e977fe36a 100644
+--- a/xbmc/cores/VideoPlayer/DVDCodecs/Video/felgpu.h
++++ b/xbmc/cores/VideoPlayer/DVDCodecs/Video/felgpu.h
+@@ -54,6 +54,11 @@ void felgpu_destroy(struct felgpu *f);
+ /* EL planes, yuv420p10 (16-bit samples), strides in samples */
+ void felgpu_set_el(struct felgpu *f, const uint16_t *y, int y_stride,
+                    const uint16_t *cb, const uint16_t *cr, int c_stride);
++/*
++ * hardware decoded EL: the EL picture as a (w/2 x h/2) texture of packed
++ * words laid out like the BL (see dvfel_uapi.h), instead of felgpu_set_el
++ */
++void felgpu_set_el_tex(struct felgpu *f, GLuint el);
+ void felgpu_set_meta(struct felgpu *f, const struct felgpu_meta *m);
+ 
+ /* compose bl_tex (dma-buf import, RGBA8) into out_fbo (dma-buf, RGBA8) */
+diff --git a/xbmc/utils/BitstreamConverter.cpp b/xbmc/utils/BitstreamConverter.cpp
+index 37c5fc2018..fed6d0a1b1 100644
+--- a/xbmc/utils/BitstreamConverter.cpp
++++ b/xbmc/utils/BitstreamConverter.cpp
+@@ -1044,7 +1044,7 @@ bool CBitstreamConverter::Convert(uint8_t* pData, int iSize)
+                 // Drop the enhancement layer only for the profile-7 -> 8.1
+                 // conversion; in RPU-processing-only mode (L5/CMv4.0 on an
+                 // annex-b stream) the in-band EL must survive for FEL/MEL.
+-                if (nal_type != HEVC_NAL_UNSPEC63 || !m_convert_dovi)
++                if (nal_type != HEVC_NAL_UNSPEC63 || !m_convert_dovi || m_keepDoviEl)
+                   BitstreamAllocAndCopy(&m_convertBuffer, &offset, buf, size, nal_type);
+                 else
+                   SinkElNal63(buf, size);
+@@ -1375,7 +1375,7 @@ bool CBitstreamConverter::Convert(uint8_t *pData_bl, int iSize_bl, uint8_t *pDat
+       }
+       else
+       {
+-        if (!m_convert_dovi)
++        if (!m_convert_dovi || m_keepDoviEl)
+           BitstreamAllocAndCopy(&m_convertBuffer, &offset, buf, size, HEVC_NAL_UNSPEC63);
+         else if (m_doviElSink)
+           m_doviElSink->OnDoviElNal(buf, size); // raw EL NAL of the EL track
+@@ -1972,7 +1972,7 @@ bool CBitstreamConverter::BitstreamConvert(uint8_t* pData,
+           }
+ #endif
+         }
+-        else if (m_convert_dovi && unit_type == HEVC_NAL_UNSPEC63)
++        else if (m_convert_dovi && !m_keepDoviEl && unit_type == HEVC_NAL_UNSPEC63)
+         {
+           // Ignore the enhancement layer, may or may not help
+           write_buf = false;
+diff --git a/xbmc/utils/BitstreamConverter.h b/xbmc/utils/BitstreamConverter.h
+index 288247be37..e83d01e3b6 100644
+--- a/xbmc/utils/BitstreamConverter.h
++++ b/xbmc/utils/BitstreamConverter.h
+@@ -191,6 +191,10 @@ public:
+   void ResetStartDecode();
+   bool CanStartDecode() const;
+   void SetConvertDovi(bool value) { m_convert_dovi = value; }
++  // With the conversion on, keep the EL NAL units in the stream anyway: S5 decodes
++  // the EL in hardware (Dolby Vision dual layer) for the dvfel FEL composition,
++  // while the Dolby Vision core gets the converted (no-op) RPU.
++  void SetKeepDoviEl(bool value) { m_keepDoviEl = value; }
+   // Real DV RPU stream (profile 5/7/8): run processDoviRpu on the already-
+   // annex-b single-stream path too (TS/M2TS input), so L5 active-area and
+   // CMv4.0 append apply there like they do on the hvcC and dual-layer paths.
+@@ -333,6 +337,7 @@ protected:
+   AVCodecID m_codec;
+   bool m_start_decode;
+   bool m_convert_dovi;
++  bool m_keepDoviEl{false};
+   bool m_process_dovi_rpu{false};
+   bool m_removeDovi;
+   bool m_removeHdr10Plus;

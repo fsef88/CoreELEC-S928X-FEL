@@ -1,0 +1,28 @@
+From 068d4e252f0052558b0ed58899b3967d1b7fa48d Mon Sep 17 00:00:00 2001
+From: portisch <hugo.portisch@yahoo.de>
+Date: Sun, 19 Jul 2026 10:19:29 -0400
+Subject: [PATCH] seek: limit seek position to title duration
+
+---
+ src/libbluray/bluray.c | 5 +++--
+ 1 file changed, 3 insertions(+), 2 deletions(-)
+
+diff --git a/src/libbluray/bluray.c b/src/libbluray/bluray.c
+index 5743592f..21fbcb67 100644
+--- a/src/libbluray/bluray.c
++++ b/src/libbluray/bluray.c
+@@ -1761,8 +1761,9 @@ static int64_t _seek_time(BLURAY *bd, uint64_t tick, uint8_t is_uo_mask_checked)
+         }
+     }
+ 
+-    if (bd->title &&
+-        tick < bd->title->duration) {
++    if (bd->title) {
++        if (tick > bd->title->duration)
++            tick = bd->title->duration;
+ 
+         _change_angle(bd);
+ 
+-- 
+2.43.0
+

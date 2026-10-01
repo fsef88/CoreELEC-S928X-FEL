@@ -1,0 +1,7 @@
+<advancedsettings version="1.0">
+  <gputempcommand>/usr/bin/gputemp</gputempcommand>
+
+  <showexitbutton>false</showexitbutton>
+  <remotedelay>1</remotedelay>
+  <splash>false</splash>
+</advancedsettings>
