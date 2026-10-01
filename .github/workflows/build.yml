@@ -1,0 +1,35 @@
+name: Build CoreELEC S928X (dv-fel-s5 optimized)
+
+on:
+  push:
+    branches:
+      - master
+      - v1.0-stable-fel-opt
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: Build Official CoreELEC Docker Container
+        run: |
+          docker build -t coreelec tools/docker/noble
+
+      - name: Build CoreELEC Amlogic-no Image
+        run: |
+          docker run --rm -v ${{ github.workspace }}:/build -w /build \
+            -e PROJECT=Amlogic-ce -e DEVICE=Amlogic-no -e ARCH=aarch64 \
+            coreelec make image
+
+      - name: Upload Built Image
+        uses: actions/upload-artifact@v4
+        with:
+          name: CoreELEC-Amlogic-no-S928X-P7-FEL-Optimized
+          path: |
+            target/*.img.gz
+            target/*.tar
