@@ -195,7 +195,8 @@ if { [ -d "${SOURCES}/${PKG_NAME}" ] || [ -d "${PKG_DIR}/sources" ]; } || pkg_ca
         if grep -qE '^GIT binary patch$|^rename from|^rename to' ${i}; then
           git apply --directory="${PKG_BUILD}" -p1 --verbose --whitespace=nowarn --unsafe-paths <${i} >&${VERBOSE_OUT}
         else
-          patch -d "${PKG_BUILD}" -p1 <${i} >&${VERBOSE_OUT}
+          patch -d "${PKG_BUILD}" -p1 <${i} >&${VERBOSE_OUT} || \
+          patch -d "${PKG_BUILD}" -p1 --ignore-whitespace <${i} >&${VERBOSE_OUT}
         fi
       fi
     done

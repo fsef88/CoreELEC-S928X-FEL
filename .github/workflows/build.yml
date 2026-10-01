@@ -39,6 +39,23 @@ jobs:
         run: |
           sudo chown -R $(id -u):$(id -g) ${{ github.workspace }}
 
+      - name: Dump Failure Logs
+        if: failure()
+        run: |
+          echo "=== FAILED PACKAGE LOGS ==="
+          find build.* -name "*.log" 2>/dev/null | head -n 5 | while read f; do
+            echo "--- LOG: $f ---"
+            tail -n 80 "$f"
+          done || true
+
+      - name: Upload Build Logs on Failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-failure-logs
+          path: |
+            build.*/**/.threads/logs/*.log
+
       - name: Upload Built Image
         uses: actions/upload-artifact@v4
         with:

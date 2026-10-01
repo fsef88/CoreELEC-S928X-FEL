@@ -13,6 +13,10 @@ PKG_LONGDESC="7-Zip is a file archiver with a high compression ratio"
 PKG_TAR_STRIP_COMPONENTS="--strip-components=0"
 PKG_TOOLCHAIN="manual"
 
+pre_patch() {
+  find ${PKG_BUILD} -type f -exec sed -i -e 's/\r$//' {} +
+}
+
 pre_build_host() {
   rm -fr ${PKG_BUILD}/.${HOST_NAME}
   mkdir -p ${PKG_BUILD}/.${HOST_NAME}

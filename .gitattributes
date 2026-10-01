@@ -1,0 +1,13 @@
+# Set default behavior to automatically handle line endings and convert to LF on commit
+* text=auto eol=lf
+
+# Explicitly enforce LF line endings for scripts, patches, makefiles, and sources
+*.patch text eol=lf
+*.sh text eol=lf
+*.mk text eol=lf
+*.h text eol=lf
+*.c text eol=lf
+*.cpp text eol=lf
+*.glsl text eol=lf
+scripts/* text eol=lf
+tools/* text eol=lf
