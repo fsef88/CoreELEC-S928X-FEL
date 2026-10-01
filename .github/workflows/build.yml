@@ -16,15 +16,28 @@ jobs:
         with:
           fetch-depth: 1
 
+      - name: Prepare Workspace and Script Permissions
+        run: |
+          chmod -R +x scripts/ tools/
+          sudo chown -R 1000:1000 ${{ github.workspace }}
+
       - name: Build Official CoreELEC Docker Container
         run: |
           docker build -t coreelec tools/docker/noble
 
       - name: Build CoreELEC Amlogic-no Image
         run: |
-          docker run --rm -v ${{ github.workspace }}:/build -w /build \
+          docker run --rm \
+            -u 1000:1000 \
+            -v ${{ github.workspace }}:/build \
+            -w /build \
             -e PROJECT=Amlogic-ce -e DEVICE=Amlogic-no -e ARCH=aarch64 \
-            coreelec make image
+            coreelec bash -c "git config --global --add safe.directory /build && make image"
+
+      - name: Restore Permissions for Artifact Upload
+        if: always()
+        run: |
+          sudo chown -R $(id -u):$(id -g) ${{ github.workspace }}
 
       - name: Upload Built Image
         uses: actions/upload-artifact@v4
